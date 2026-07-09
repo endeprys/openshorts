@@ -9,6 +9,13 @@ services:
       - /app/__pycache__
       - ./output:/app/output
     restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   frontend:
     build: ./dashboard
