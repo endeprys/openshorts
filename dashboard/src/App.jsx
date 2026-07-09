@@ -155,6 +155,24 @@ function App() {
     return '';
   });
 
+  // YouTube Direct Upload State
+  const [youtubeClientId, setYoutubeClientId] = useState(() => {
+    const stored = localStorage.getItem('youtubeClientId_v1');
+    if (stored) return decrypt(stored);
+    return '';
+  });
+  const [youtubeClientSecret, setYoutubeClientSecret] = useState(() => {
+    const stored = localStorage.getItem('youtubeClientSecret_v1');
+    if (stored) return decrypt(stored);
+    return '';
+  });
+  const [youtubeRefreshToken, setYoutubeRefreshToken] = useState(() => {
+    const stored = localStorage.getItem('youtubeRefreshToken_v1');
+    if (stored) return decrypt(stored);
+    return '';
+  });
+  const [youtubeAuthed, setYoutubeAuthed] = useState(() => !!localStorage.getItem('youtubeRefreshToken_v1'));
+
   const [uploadUserId, setUploadUserId] = useState(() => localStorage.getItem('uploadUserId') || '');
   const [userProfiles, setUserProfiles] = useState([]); // List of {username, connected: []}
   const [showKeyModal, setShowKeyModal] = useState(false);
@@ -673,6 +691,137 @@ function App() {
 
               <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-lg font-semibold">YouTube Direct Upload</h2>
+                  <span className="text-[10px] bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-emerald-400 uppercase tracking-wider">Free</span>
+                </div>
+                <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
+                  Publish directly to <strong>YouTube Shorts</strong> for free using the YouTube Data API v3.
+                  No paid third-party services needed.
+                </p>
+                <div className="space-y-4">
+                  <label className="block text-sm text-zinc-400">Google Cloud Client ID</label>
+                  <input
+                    type="password"
+                    value={youtubeClientId}
+                    onChange={(e) => setYoutubeClientId(e.target.value)}
+                    className="input-field w-full"
+                    placeholder="123456789-xxxxx.apps.googleusercontent.com"
+                  />
+                  <label className="block text-sm text-zinc-400">Google Cloud Client Secret</label>
+                  <input
+                    type="password"
+                    value={youtubeClientSecret}
+                    onChange={(e) => setYoutubeClientSecret(e.target.value)}
+                    className="input-field w-full"
+                    placeholder="GOCSPX-..."
+                  />
+                  <div className="flex gap-2 flex-wrap">
+                    <button
+                      onClick={async () => {
+                        if (!youtubeClientId || !youtubeClientSecret) {
+                          alert('Enter your Client ID and Client Secret first.');
+                          return;
+                        }
+                        localStorage.setItem('youtubeClientId_v1', encrypt(youtubeClientId));
+                        localStorage.setItem('youtubeClientSecret_v1', encrypt(youtubeClientSecret));
+                        // Backend API URL for redirect (same origin in dev with proxy, or VITE_API_URL)
+                        const apiBase = import.meta.env.VITE_API_URL || window.location.origin;
+                        const redirectUri = apiBase + '/api/youtube/callback';
+                        const urlRes = await fetch(getApiUrl('/api/youtube/auth-url'), {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ client_id: youtubeClientId, redirect_uri: redirectUri }),
+                        });
+                        if (!urlRes.ok) { alert('Failed to get auth URL'); return; }
+                        const { url } = await urlRes.json();
+                        const popup = window.open(url, 'youtube-auth', 'width=600,height=700');
+                        const msgHandler = async (event) => {
+                          if (event.data?.type === 'youtube-oauth-code') {
+                            window.removeEventListener('message', msgHandler);
+                            const code = event.data.code;
+                            const tokenRes = await fetch(getApiUrl('/api/youtube/token'), {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                client_id: youtubeClientId,
+                                client_secret: youtubeClientSecret,
+                                code,
+                                redirect_uri: redirectUri,
+                              }),
+                            });
+                            if (!tokenRes.ok) { const err = await tokenRes.text(); alert('OAuth failed: ' + err); return; }
+                            const tokenData = await tokenRes.json();
+                            if (tokenData.refresh_token) {
+                              localStorage.setItem('youtubeRefreshToken_v1', encrypt(tokenData.refresh_token));
+                              setYoutubeRefreshToken(tokenData.refresh_token);
+                              setYoutubeAuthed(true);
+                              alert('YouTube connected!');
+                              popup?.close();
+                            } else {
+                              alert('No refresh token received. You may need to re-authorize and ensure "access_type=offline" is used.');
+                            }
+                          }
+                        };
+                        window.addEventListener('message', msgHandler);
+                        const pollTimer = setInterval(() => {
+                          if (popup?.closed) { clearInterval(pollTimer); window.removeEventListener('message', msgHandler); }
+                        }, 500);
+                      }}
+                      className="btn-primary py-2 px-4 text-sm"
+                    >
+                      Connect YouTube
+                    </button>
+                    {youtubeAuthed && (
+                      <span className="flex items-center gap-1 text-xs text-green-400 px-2">
+                        <CheckCircle2 size={14} /> Connected
+                      </span>
+                    )}
+                    {youtubeRefreshToken && (
+                      <button
+                        onClick={() => {
+                          localStorage.removeItem('youtubeRefreshToken_v1');
+                          setYoutubeRefreshToken('');
+                          setYoutubeAuthed(false);
+                          alert('YouTube disconnected.');
+                        }}
+                        className="py-2 px-3 text-sm text-red-400 hover:text-red-300 border border-red-500/20 rounded-lg"
+                      >
+                        Disconnect
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-xs text-zinc-500 leading-relaxed">
+                    {youtubeAuthed ? (
+                      <span className="text-green-400/80">✓ YouTube connected. You can now publish Shorts directly without Upload-Post.</span>
+                    ) : (
+                      <>
+                        To get credentials:
+                        <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
+                            <span className="text-zinc-400 font-medium">1. Create OAuth</span>
+                            <span className="text-[10px] text-zinc-600">Console → Credentials → OAuth 2.0</span>
+                          </a>
+                          <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
+                            <span className="text-zinc-400 font-medium">2. Enable API</span>
+                            <span className="text-[10px] text-zinc-600">YouTube Data API v3</span>
+                          </a>
+                          <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
+                            <span className="text-zinc-400 font-medium">3. Add Redirect</span>
+                            <span className="text-[10px] text-zinc-600">{window.location.origin}/api/youtube/callback</span>
+                          </a>
+                        </div>
+                      </>
+                    )}
+                    <br />
+                    <span className="text-zinc-600 italic">
+                      Keys stored encrypted in your browser. Sent to backend only for OAuth token exchange and uploads.
+                    </span>
+                  </p>
+                </div>
+              </div>
+
+              <div className="glass-panel p-6 mt-8">
+                <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-semibold">AI Shorts (UGC Videos)</h2>
                   <span className="text-[10px] bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded text-violet-400 uppercase tracking-wider">New</span>
                 </div>
@@ -979,6 +1128,9 @@ function App() {
                           uploadUserId={uploadUserId}
                           geminiApiKey={apiKey}
                           elevenLabsKey={elevenLabsKey}
+                          youtubeClientId={youtubeClientId}
+                          youtubeClientSecret={youtubeClientSecret}
+                          youtubeRefreshToken={youtubeRefreshToken}
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                         />

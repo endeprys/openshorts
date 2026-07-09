@@ -421,6 +421,7 @@ from subtitles import generate_srt, burn_subtitles, generate_srt_from_video
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
+from youtube_uploader import get_oauth_url, exchange_code, refresh_access_token, upload_video as yt_upload_video
 
 class EditRequest(BaseModel):
     job_id: str
@@ -1194,6 +1195,130 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
             
         except Exception as e:
              raise HTTPException(status_code=500, detail=str(e))
+
+# ═══════════════════════════════════════════════════════════════════════
+# YouTube Direct Upload (Free, uses YouTube Data API v3)
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/youtube/callback")
+async def youtube_callback(code: Optional[str] = None, error: Optional[str] = None):
+    """OAuth callback handler — serves HTML to communicate code back to opener window."""
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>YouTube OAuth</title></head>
+<body>
+<script>
+(function() {{
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const error = params.get('error');
+    if (code) {{
+        window.opener.postMessage({{ type: 'youtube-oauth-code', code: code }}, '*');
+        document.body.innerHTML = '<p style="font-family:sans-serif;text-align:center;margin-top:40px">✅ Authorized! You can close this window.</p>';
+    }} else {{
+        document.body.innerHTML = '<p style="font-family:sans-serif;text-align:center;margin-top:40px;color:red">❌ Authorization failed: ' + (error || 'unknown') + '</p>';
+    }}
+}})();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+class YoutubeAuthUrlRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+
+@app.post("/api/youtube/auth-url")
+async def youtube_auth_url(req: YoutubeAuthUrlRequest):
+    """Generate the OAuth consent URL for YouTube authorization."""
+    try:
+        url = get_oauth_url(req.client_id, req.redirect_uri)
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class YoutubeTokenRequest(BaseModel):
+    client_id: str
+    client_secret: str
+    code: str
+    redirect_uri: str
+
+@app.post("/api/youtube/token")
+async def youtube_token(req: YoutubeTokenRequest):
+    """Exchange OAuth code for refresh token."""
+    try:
+        result = exchange_code(req.client_id, req.client_secret, req.code, req.redirect_uri)
+        return {
+            "refresh_token": result.get("refresh_token", ""),
+            "access_token": result.get("access_token", ""),
+            "expires_in": result.get("expires_in", 3600),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class YoutubeUploadRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    title: Optional[str] = None
+    description: Optional[str] = None
+    privacy_status: str = "public"
+
+@app.post("/api/youtube/upload")
+async def youtube_upload(
+    req: YoutubeUploadRequest,
+    x_youtube_refresh_token: Optional[str] = Header(None, alias="X-Youtube-Refresh-Token"),
+    x_youtube_client_id: Optional[str] = Header(None, alias="X-Youtube-Client-Id"),
+    x_youtube_client_secret: Optional[str] = Header(None, alias="X-Youtube-Client-Secret"),
+):
+    if not x_youtube_refresh_token:
+        raise HTTPException(status_code=400, detail="Missing X-Youtube-Refresh-Token header")
+    if not x_youtube_client_id or not x_youtube_client_secret:
+        raise HTTPException(status_code=400, detail="Missing YouTube OAuth credentials")
+
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[req.job_id]
+    if 'result' not in job or 'clips' not in job['result']:
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    try:
+        clip = job['result']['clips'][req.clip_index]
+        filename = clip['video_url'].split('/')[-1]
+        file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
+
+        # Get fresh access token
+        token_data = refresh_access_token(x_youtube_client_id, x_youtube_client_secret, x_youtube_refresh_token)
+        access_token = token_data["access_token"]
+
+        final_title = req.title or clip.get('video_title_for_youtube_short', 'Viral Short')
+        final_description = req.description or clip.get('video_description_for_youtube', '')
+
+        print(f"📤 Uploading to YouTube: {final_title}")
+        result = yt_upload_video(
+            file_path=file_path,
+            access_token=access_token,
+            title=final_title,
+            description=final_description,
+            privacy_status=req.privacy_status,
+        )
+
+        video_id = result.get("id", "")
+        video_url = f"https://youtu.be/{video_id}"
+
+        return {
+            "success": True,
+            "video_id": video_id,
+            "video_url": video_url,
+        }
+
+    except Exception as e:
+        print(f"❌ YouTube Upload Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- Thumbnail Studio Endpoints ---
 

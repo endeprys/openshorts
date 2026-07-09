@@ -440,7 +440,8 @@ def get_video_resolution(video_path):
 
 
 def sanitize_filename(filename):
-    """Remove invalid characters from filename."""
+    """Remove invalid characters and non-ASCII from filename."""
+    filename = re.sub(r'[^\x20-\x7E]', '_', filename)
     filename = re.sub(r'[<>:"/\\|?*#]', '', filename)
     filename = filename.replace(' ', '_')
     return filename[:100]
@@ -608,11 +609,18 @@ def process_video_to_vertical(input_video, final_output_video):
 
     print("\n   🧠 Step 2: Preparing Active Tracking...")
     original_width, original_height = get_video_resolution(input_video)
-    
-    OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
+
+    TARGET_HEIGHT = 1920
+    if original_height < TARGET_HEIGHT:
+        OUTPUT_HEIGHT = TARGET_HEIGHT
+        OUTPUT_WIDTH = int(TARGET_HEIGHT * ASPECT_RATIO)
+    else:
+        OUTPUT_HEIGHT = original_height
+        OUTPUT_WIDTH = int(original_height * ASPECT_RATIO)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
+
+    print(f"   📐 Output resolution: {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} (source: {original_width}x{original_height})")
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
@@ -628,7 +636,10 @@ def process_video_to_vertical(input_video, final_output_video):
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-preset', 'medium', '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        '-color_range', '2',
+        '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -725,12 +736,16 @@ def process_video_to_vertical(input_video, final_output_video):
     if os.path.exists(temp_audio_output):
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
-            '-c:v', 'copy', '-c:a', 'copy', final_output_video
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-movflags', '+faststart',
+            final_output_video
         ]
     else:
          merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output,
-            '-c:v', 'copy', final_output_video
+            '-c:v', 'copy',
+            '-movflags', '+faststart',
+            final_output_video
         ]
         
     try:
@@ -994,6 +1009,7 @@ if __name__ == '__main__':
                     '-i', input_video,
                     '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
                     '-c:a', 'aac',
+                    '-movflags', '+faststart',
                     clip_temp_path
                 ]
                 subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

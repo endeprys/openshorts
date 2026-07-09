@@ -47,6 +47,12 @@ docker-compose.yml
 README.md
 *.md
 
+# Caches (huggingface whisper models, etc)
+.cache/
+
+# Output (mounted via volume)
+output/
+
 
 
 

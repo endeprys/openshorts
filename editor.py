@@ -301,7 +301,7 @@ class VideoEditor:
         
         if not filter_data or "filter_string" not in filter_data:
             print("⚠️ No filter string found. Copying original.")
-            subprocess.run(['ffmpeg', '-y', '-i', input_path, '-c', 'copy', output_path])
+            subprocess.run(['ffmpeg', '-y', '-i', input_path, '-c', 'copy', '-movflags', '+faststart', output_path])
             return
 
         filter_string = filter_data["filter_string"]
@@ -342,6 +342,7 @@ class VideoEditor:
             '-vf', filter_string,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
             '-c:a', 'copy',
+            '-movflags', '+faststart',
             output_path
         ]
         

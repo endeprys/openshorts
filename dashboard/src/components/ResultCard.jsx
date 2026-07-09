@@ -6,7 +6,7 @@ import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
-export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onPlay, onPause }) {
+export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, youtubeClientId, youtubeClientSecret, youtubeRefreshToken, onPlay, onPause }) {
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
@@ -316,14 +316,68 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     };
 
     const handlePost = async () => {
-        if (!uploadPostKey || !uploadUserId) {
-            setPostResult({ success: false, msg: "Missing API Key or User ID." });
-            return;
-        }
-
         const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
         if (selectedPlatforms.length === 0) {
             setPostResult({ success: false, msg: "Select at least one platform." });
+            return;
+        }
+
+        // YouTube direct upload (no Upload-Post needed)
+        const wantsYoutube = selectedPlatforms.includes('youtube');
+        const wantsOther = selectedPlatforms.some(p => p !== 'youtube');
+
+        if (wantsYoutube && !wantsOther) {
+            // YouTube only — use direct upload
+            if (!youtubeRefreshToken) {
+                setPostResult({ success: false, msg: "YouTube not connected. Go to Settings → YouTube Direct Upload." });
+                return;
+            }
+
+            if (isScheduling && !scheduleDate) {
+                setPostResult({ success: false, msg: "Please select a date and time." });
+                return;
+            }
+
+            setPosting(true);
+            setPostResult(null);
+
+            try {
+                const res = await fetch(getApiUrl('/api/youtube/upload'), {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Youtube-Refresh-Token': youtubeRefreshToken,
+                        'X-Youtube-Client-Id': youtubeClientId,
+                        'X-Youtube-Client-Secret': youtubeClientSecret,
+                    },
+                    body: JSON.stringify({
+                        job_id: jobId,
+                        clip_index: index,
+                        title: postTitle || clip.video_title_for_youtube_short || 'Viral Short',
+                        description: postDescription || clip.video_description_for_tiktok || '',
+                    }),
+                });
+
+                if (!res.ok) {
+                    const errText = await res.text();
+                    try { const j = JSON.parse(errText); throw new Error(j.detail || errText); }
+                    catch (e) { throw new Error(errText); }
+                }
+
+                const data = await res.json();
+                setPostResult({ success: true, msg: `Posted to YouTube Shorts! ${data.video_url}` });
+                setTimeout(() => { setShowModal(false); setPostResult(null); }, 4000);
+            } catch (e) {
+                setPostResult({ success: false, msg: `YouTube upload failed: ${e.message}` });
+            } finally {
+                setPosting(false);
+            }
+            return;
+        }
+
+        // Mixed platforms or non-YouTube — use Upload-Post
+        if (!uploadPostKey || !uploadUserId) {
+            setPostResult({ success: false, msg: "Missing Upload-Post API Key or User ID for TikTok/Instagram." });
             return;
         }
 
@@ -347,9 +401,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             };
 
             if (isScheduling && scheduleDate) {
-                // Convert to ISO-8601
                 payload.scheduled_date = new Date(scheduleDate).toISOString();
-                // Optional: pass timezone if needed, backend defaults to UTC or we can send user's timezone
                 payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             }
 
@@ -361,20 +413,12 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             if (!res.ok) {
                 const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch (e) {
-                    throw new Error(errText);
-                }
+                try { const j = JSON.parse(errText); throw new Error(j.detail || errText); }
+                catch (e) { throw new Error(errText); }
             }
 
             setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
-            setTimeout(() => {
-                setShowModal(false);
-                setPostResult(null);
-            }, 3000);
-
+            setTimeout(() => { setShowModal(false); setPostResult(null); }, 3000);
         } catch (e) {
             setPostResult({ success: false, msg: `Failed: ${e.message}` });
         } finally {
@@ -552,10 +596,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
                         <h3 className="text-lg font-bold text-white mb-4">Post / Schedule</h3>
 
-                        {!uploadPostKey && (
+                        {!uploadPostKey && !youtubeRefreshToken && (
                             <div className="mb-4 p-3 bg-yellow-500/10 border border-yellow-500/20 text-yellow-200 text-xs rounded-lg flex items-start gap-2">
                                 <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                                <div>Configure API Key in Settings first.</div>
+                                <div>Connect YouTube in Settings (free) or add Upload-Post API Key for TikTok/Instagram.</div>
                             </div>
                         )}
 
@@ -640,8 +684,8 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
                         <button
                             onClick={handlePost}
-                            disabled={posting || !uploadPostKey}
-                            className="w-full py-3 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl text-white font-bold transition-all flex items-center justify-center gap-2"
+                            disabled={posting || (!uploadPostKey && !youtubeRefreshToken)}
+                            className="w-full py-3 bg-primary hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-bold flex items-center justify-center gap-2 transition-all active:scale-[0.98]"
                         >
                             {posting ? <><Loader2 size={16} className="animate-spin" /> {isScheduling ? 'Scheduling...' : 'Publishing...'}</> : <><Share2 size={16} /> {isScheduling ? 'Schedule Post' : 'Publish Now'}</>}
                         </button>
