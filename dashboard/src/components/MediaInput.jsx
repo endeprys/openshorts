@@ -53,7 +53,7 @@ export default function MediaInput({ onProcess, isProcessing, model, onModelChan
                             }`}
                     >
                         <Youtube size={18} />
-                        YouTube URL
+                        Video URL (YouTube, VK)
                     </button>
                 )}
                 <button
@@ -75,7 +75,7 @@ export default function MediaInput({ onProcess, isProcessing, model, onModelChan
                             type="url"
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
-                            placeholder="https://www.youtube.com/watch?v=..."
+                            placeholder="https://www.youtube.com/watch?v=... or https://vk.com/video-..."
                             className="input-field"
                             required
                         />

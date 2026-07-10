@@ -446,13 +446,14 @@ def sanitize_filename(filename):
     return filename[:100]
 
 
-def download_youtube_video(url, output_dir="."):
+def download_video(url, output_dir="."):
     """
-    Downloads a YouTube video using yt-dlp.
+    Downloads a video from a URL using yt-dlp (YouTube, VK, etc.).
     Returns the path to the downloaded video and the video title.
     """
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
-    print("📥 Downloading video from YouTube...")
+    source = "YouTube" if "youtube.com" in url or "youtu.be" in url else ("VK" if "vk.com" in url else "video")
+    print(f"📥 Downloading {source} video...")
     step_start_time = time.time()
 
     cookies_path = '/app/cookies.txt'
@@ -513,21 +514,21 @@ def download_youtube_video(url, output_dir="."):
             import traceback
             
             # Print minimal error first to ensure something gets out
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
+            print("🚨 VIDEO DOWNLOAD ERROR 🚨", file=sys.stderr)
             
             error_msg = f"""
             
 ❌ ================================================================= ❌
-❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
+❌ FATAL ERROR: VIDEO DOWNLOAD FAILED
 ❌ ================================================================= ❌
-            
-REASON: YouTube has blocked the download request (Error 429/Unavailable).
-        This is likely a temporary IP ban on this server.
 
-👇 SOLUTION FOR USER 👇
+REASON: {str(e)}
+
+👇 POSSIBLE SOLUTIONS 👇
 ---------------------------------------------------------------------
-1. Download the video manually to your computer.
-2. Use the 'Upload Video' tab in this app to process it.
+1. Check the URL is correct and the video is publicly accessible.
+2. For YouTube: set YOUTUBE_COOKIES env var (browser cookies).
+3. Download the video manually and use the 'Upload File' tab.
 ---------------------------------------------------------------------
 
 Technical Details: {str(e)}
@@ -1057,7 +1058,7 @@ if __name__ == '__main__':
             else:
                 output_dir = "."
         
-        input_video, video_title = download_youtube_video(args.url, output_dir)
+        input_video, video_title = download_video(args.url, output_dir)
     else:
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
