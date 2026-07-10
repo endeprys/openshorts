@@ -16,6 +16,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+import db as db_module
+from db import (init_db, create_project, get_project, list_projects, update_project, delete_project,
+                create_clip, list_clips, delete_clips_by_project, get_clip, update_clip,
+                update_clip_video_url, get_clip_by_project_and_index,
+                create_schedule, get_schedule, list_schedules, update_schedule, delete_schedule,
+                get_due_schedules, mark_overdue_schedules, get_calendar)
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -159,13 +166,75 @@ async def run_job_wrapper(job_id):
         job_queue.task_done()
         print(f"✅ Released slot for job: {job_id}")
 
+async def schedule_dispatcher():
+    """Background worker that dispatches due YouTube uploads."""
+    await asyncio.sleep(10)
+    print("📅 Schedule dispatcher started.")
+    while True:
+        try:
+            # Mark overdue schedules
+            mark_overdue_schedules()
+            # Pick up to 2 due schedules
+            due = get_due_schedules(limit=2)
+            for s in due:
+                print(f"📤 Dispatching schedule {s['id']}...")
+                update_schedule(s['id'], status='uploading')
+                try:
+                    from youtube_uploader import refresh_access_token, upload_video
+                    token_data = refresh_access_token(
+                        s['youtube_client_id'],
+                        s['youtube_client_secret'],
+                        s['youtube_refresh_token']
+                    )
+                    access_token = token_data["access_token"]
+
+                    c = db_module.get_conn()
+                    clip_row = c.execute(
+                        "SELECT * FROM clips WHERE id=?", (s['clip_id'],)
+                    ).fetchone()
+                    c.close()
+                    if not clip_row:
+                        update_schedule(s['id'], status='failed', error='Clip not found')
+                        continue
+                    clip_dict = dict(clip_row)
+                    file_path = os.path.join(OUTPUT_DIR, s['project_id'], clip_dict['video_url'].split('/')[-1])
+                    if not os.path.exists(file_path):
+                        update_schedule(s['id'], status='failed', error=f'Video file not found: {file_path}')
+                        continue
+
+                    upload_title = s['title'] or clip_dict.get('title', 'Viral Short')
+                    upload_desc = (s['description'] or
+                                   clip_dict.get('hook_text', '') or
+                                   clip_dict.get('description_tiktok', '') or
+                                   clip_dict.get('description_instagram', '') or '')
+                    result = upload_video(
+                        file_path=file_path,
+                        access_token=access_token,
+                        title=upload_title,
+                        description=upload_desc,
+                        privacy_status=s['privacy_status'],
+                    )
+                    video_id = result.get("id", "")
+                    update_schedule(s['id'], status='done',
+                                    video_url=f"https://youtu.be/{video_id}")
+                    print(f"   ✅ Uploaded: {video_id}")
+                except Exception as e:
+                    print(f"   ❌ Schedule upload failed: {e}")
+                    update_schedule(s['id'], status='failed', error=str(e))
+        except Exception as e:
+            print(f"⚠️ Schedule dispatcher error: {e}")
+        await asyncio.sleep(30)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start worker and cleanup
+    # Initialize database
+    init_db()
+    # Start workers
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
+    sched_task = asyncio.create_task(schedule_dispatcher())
     yield
-    # Cleanup (optional: cancel worker)
+    # Cleanup on shutdown
 
 app = FastAPI(lifespan=lifespan)
 
@@ -313,6 +382,46 @@ async def run_job(job_id, job_data):
                      clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
                 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+
+                # Save to SQLite database
+                try:
+                    job_data = jobs.get(job_id, {})
+                    env = job_data.get('env', {})
+                    source_url = env.get('SOURCE_URL', '')
+                    source_type = env.get('SOURCE_TYPE', 'url') if source_url else 'file'
+                    model_used = env.get('GEMINI_MODEL_NAME', '')
+                    output_lang = env.get('OUTPUT_LANGUAGE', 'English')
+
+                    p = create_project(
+                        pid=job_id,
+                        title=base_name,
+                        source_url=source_url,
+                        source_type=source_type,
+                        duration=0,
+                        status='done',
+                        model_used=model_used,
+                        lang=output_lang,
+                        transcript=json.dumps(data.get('transcript', '')),
+                        cost_data=json.dumps(cost_analysis) if cost_analysis else '',
+                    )
+                    if p:
+                        for i, clip_data in enumerate(clips):
+                            create_clip(
+                                cid=f"{job_id}_clip_{i}",
+                                project_id=job_id,
+                                clip_index=i,
+                                video_url=clip_data.get('video_url', ''),
+                                start_time=clip_data.get('start', 0),
+                                end_time=clip_data.get('end', 0),
+                                duration=clip_data.get('end', 0) - clip_data.get('start', 0),
+                                title=clip_data.get('video_title_for_youtube_short', ''),
+                                description_tiktok=clip_data.get('video_description_for_tiktok', ''),
+                                description_instagram=clip_data.get('video_description_for_instagram', ''),
+                                hook_text=clip_data.get('viral_hook_text', ''),
+                            )
+                        print(f"💾 Saved project {job_id} with {len(clips)} clips to database")
+                except Exception as e:
+                    print(f"⚠️ DB save failed: {e}")
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -407,6 +516,8 @@ async def process_endpoint(
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
+    env["SOURCE_URL"] = url or (file.filename if file else '')
+    env["SOURCE_TYPE"] = "url" if url else "file"
 
     if model:
         env["GEMINI_MODEL_NAME"] = model
@@ -775,9 +886,6 @@ class SubtitleRequest(BaseModel):
 @app.get("/api/clip/{job_id}/{clip_index}/transcript")
 async def get_clip_transcript(job_id: str, clip_index: int):
     """Return word-level captions for a specific clip, formatted for Remotion."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     output_dir = os.path.join(OUTPUT_DIR, job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
 
@@ -965,29 +1073,29 @@ async def persist_blob_video(
     clip_index: int = Form(...),
     file: UploadFile = File(...)
 ):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[job_id]
-    if 'result' not in job or 'clips' not in job['result']:
-        raise HTTPException(status_code=400, detail="Job result not available")
-
-    if clip_index >= len(job['result']['clips']):
-        raise HTTPException(status_code=404, detail="Clip not found")
-
     contents = await file.read()
 
     timestamp = int(time.time())
     filename = f"browser_rendered_{clip_index}_{timestamp}.mp4"
     output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "wb") as f:
         f.write(contents)
 
     video_url = f"/videos/{job_id}/{filename}"
-    job['result']['clips'][clip_index]['video_url'] = video_url
 
+    # Update in-memory job (optional — job may not be alive)
+    if job_id in jobs:
+        try:
+            job = jobs[job_id]
+            if 'result' in job and 'clips' in job['result'] and clip_index < len(job['result']['clips']):
+                job['result']['clips'][clip_index]['video_url'] = video_url
+        except Exception as e:
+            print(f"⚠️ Failed to update in-memory job: {e}")
+
+    # Update metadata.json on disk
     try:
         json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
         if json_files:
@@ -1002,16 +1110,22 @@ async def persist_blob_video(
     except Exception as e:
         print(f"⚠️ Failed to update metadata.json: {e}")
 
+    # Update database
+    try:
+        db_clip = get_clip_by_project_and_index(job_id, clip_index)
+        if db_clip:
+            update_clip_video_url(db_clip['id'], video_url)
+    except Exception as e:
+        print(f"⚠️ Failed to update clip DB: {e}")
+
     return {"success": True, "video_url": video_url}
 
 
 @app.post("/api/subtitle")
 async def add_subtitles(req: SubtitleRequest):
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    # Reload job data from disk just in case metadata was updated
-    job = jobs[req.job_id]
+    job = jobs.get(req.job_id)
+    if not job:
+        print(f"⚠️ Job {req.job_id} not in memory (page refresh?) — reading from disk only")
     
     # We need to access metadata.json to get the transcript
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
@@ -1094,8 +1208,8 @@ async def add_subtitles(req: SubtitleRequest):
         raise HTTPException(status_code=500, detail=str(e))
         
     # 3. Update Result and Metadata
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
+    # Update InMemory Jobs (if still in memory)
+    if job and req.clip_index < len(job.get('result', {}).get('clips', [])):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
     
     # Update Metadata on Disk (Persistence)
@@ -1132,8 +1246,9 @@ class BatchSubtitleRequest(BaseModel):
 
 @app.post("/api/batch/subtitle")
 async def batch_add_subtitles(req: BatchSubtitleRequest, background_tasks: BackgroundTasks):
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs.get(req.job_id)
+    if not job:
+        print(f"⚠️ Job {req.job_id} not in memory — reading from disk only")
 
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
@@ -1187,9 +1302,9 @@ async def batch_add_subtitles(req: BatchSubtitleRequest, background_tasks: Backg
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, run_burn)
 
-            # Update in-memory job
-            if clip_index < len(job.get('result', {}).get('clips', [])):
-                jobs[req.job_id]['result']['clips'][clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            # Update in-memory job (if still in memory)
+            if job and clip_index < len(job.get('result', {}).get('clips', [])):
+                job['result']['clips'][clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
 
             # Update metadata on disk
             if clip_index < len(clips):
@@ -1227,35 +1342,50 @@ async def batch_youtube_upload(
     if not x_youtube_client_id or not x_youtube_client_secret:
         raise HTTPException(status_code=400, detail="Missing YouTube OAuth credentials")
 
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[req.job_id]
-    if 'result' not in job or 'clips' not in job['result']:
-        raise HTTPException(status_code=400, detail="Job result not available")
-
-    # Get fresh access token once
     token_data = refresh_access_token(x_youtube_client_id, x_youtube_client_secret, x_youtube_refresh_token)
     access_token = token_data["access_token"]
 
     results = []
     for clip_index in req.clip_indices:
         try:
-            if clip_index >= len(job['result']['clips']):
-                results.append({"clip_index": clip_index, "success": False, "error": "Clip not found"})
-                continue
+            # Try in-memory job first, fall back to database
+            video_url = None
+            clip_title = None
+            clip_hook = None
+            clip_desc_tiktok = None
+            clip_desc_ig = None
 
-            clip = job['result']['clips'][clip_index]
-            filename = clip['video_url'].split('/')[-1]
+            if req.job_id in jobs:
+                job = jobs[req.job_id]
+                if 'result' in job and 'clips' in job['result'] and clip_index < len(job['result']['clips']):
+                    c = job['result']['clips'][clip_index]
+                    video_url = c.get('video_url')
+                    clip_title = c.get('video_title_for_youtube_short')
+                    clip_hook = c.get('viral_hook_text')
+                    clip_desc_tiktok = c.get('video_description_for_tiktok')
+                    clip_desc_ig = c.get('video_description_for_instagram')
+
+            # Fall back to database
+            if not video_url:
+                db_clip = get_clip_by_project_and_index(req.job_id, clip_index)
+                if not db_clip:
+                    results.append({"clip_index": clip_index, "success": False, "error": "Clip not found"})
+                    continue
+                video_url = db_clip.get('video_url', '')
+                clip_title = db_clip.get('title')
+                clip_hook = db_clip.get('hook_text')
+                clip_desc_tiktok = db_clip.get('description_tiktok')
+                clip_desc_ig = db_clip.get('description_instagram')
+
+            filename = video_url.split('/')[-1] if video_url else ''
             file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
 
             if not os.path.exists(file_path):
                 results.append({"clip_index": clip_index, "success": False, "error": f"Video file not found: {filename}"})
                 continue
 
-            final_title = (f"{req.title} #{clip_index+1}" if req.title
-                          else clip.get('video_title_for_youtube_short', f'Viral Short #{clip_index+1}'))
-            final_description = req.description or ''
+            final_title = req.title or clip_title or f"Short #{clip_index + 1}"
+            final_description = (req.description or clip_hook or clip_desc_tiktok or clip_desc_ig or '')
 
             result = yt_upload_video(
                 file_path=file_path,
@@ -1689,27 +1819,48 @@ async def youtube_upload(
     if not x_youtube_client_id or not x_youtube_client_secret:
         raise HTTPException(status_code=400, detail="Missing YouTube OAuth credentials")
 
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    # Try in-memory job first, fall back to database
+    video_url = None
+    clip_title = None
+    clip_hook = None
+    clip_desc_tiktok = None
+    clip_desc_ig = None
 
-    job = jobs[req.job_id]
-    if 'result' not in job or 'clips' not in job['result']:
-        raise HTTPException(status_code=400, detail="Job result not available")
+    if req.job_id in jobs:
+        job = jobs[req.job_id]
+        if 'result' in job and 'clips' in job['result'] and req.clip_index < len(job['result']['clips']):
+            c = job['result']['clips'][req.clip_index]
+            video_url = c.get('video_url')
+            clip_title = c.get('video_title_for_youtube_short')
+            clip_hook = c.get('viral_hook_text')
+            clip_desc_tiktok = c.get('video_description_for_tiktok')
+            clip_desc_ig = c.get('video_description_for_instagram')
+
+    if not video_url:
+        db_clip = get_clip_by_project_and_index(req.job_id, req.clip_index)
+        if not db_clip:
+            raise HTTPException(status_code=404, detail="Clip not found")
+        video_url = db_clip.get('video_url', '')
+        clip_title = db_clip.get('title')
+        clip_hook = db_clip.get('hook_text')
+        clip_desc_tiktok = db_clip.get('description_tiktok')
+        clip_desc_ig = db_clip.get('description_instagram')
+
+    if not video_url:
+        raise HTTPException(status_code=404, detail="Video URL not found for this clip")
+
+    filename = video_url.split('/')[-1]
+    file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
 
     try:
-        clip = job['result']['clips'][req.clip_index]
-        filename = clip['video_url'].split('/')[-1]
-        file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
-
-        # Get fresh access token
         token_data = refresh_access_token(x_youtube_client_id, x_youtube_client_secret, x_youtube_refresh_token)
         access_token = token_data["access_token"]
 
-        final_title = req.title or clip.get('video_title_for_youtube_short', 'Viral Short')
-        final_description = req.description or ''
+        final_title = req.title or clip_title or 'Viral Short'
+        final_description = req.description or clip_hook or clip_desc_tiktok or clip_desc_ig or ''
 
         print(f"📤 Uploading to YouTube: {final_title}")
         result = yt_upload_video(
@@ -1733,6 +1884,198 @@ async def youtube_upload(
         print(f"❌ YouTube Upload Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Project Endpoints ─────────────────────────────────────
+
+@app.get("/api/projects")
+async def api_list_projects(limit: int = 50, offset: int = 0):
+    projects = list_projects(limit=limit, offset=offset)
+    for p in projects:
+        clips = list_clips(p['id'])
+        p['clip_count'] = len(clips)
+        p['clips'] = clips
+    return {"projects": projects}
+
+@app.get("/api/projects/{project_id}")
+async def api_get_project(project_id: str):
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project['clips'] = list_clips(project_id)
+    return project
+
+@app.delete("/api/projects/{project_id}")
+async def api_delete_project(project_id: str):
+    # Delete files
+    job_dir = os.path.join(OUTPUT_DIR, project_id)
+    if os.path.exists(job_dir):
+        shutil.rmtree(job_dir, ignore_errors=True)
+    # Delete from DB (cascade removes clips & schedules)
+    ok = delete_project(project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"success": True}
+
+@app.patch("/api/projects/{project_id}")
+async def api_update_project(project_id: str, title: Optional[str] = Form(None),
+                              source_url: Optional[str] = Form(None)):
+    kwargs = {}
+    if title is not None:
+        kwargs['title'] = title
+    if source_url is not None:
+        kwargs['source_url'] = source_url
+    project = update_project(project_id, **kwargs)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+# ── Clip Endpoints ────────────────────────────────────────
+
+class UpdateClipRequest(BaseModel):
+    title: Optional[str] = None
+    description_tiktok: Optional[str] = None
+    description_instagram: Optional[str] = None
+    hook_text: Optional[str] = None
+
+@app.patch("/api/clips/{clip_id}")
+async def api_update_clip(clip_id: str, req: UpdateClipRequest):
+    kwargs = {}
+    if req.title is not None:
+        kwargs['title'] = req.title
+    if req.description_tiktok is not None:
+        kwargs['description_tiktok'] = req.description_tiktok
+    if req.description_instagram is not None:
+        kwargs['description_instagram'] = req.description_instagram
+    if req.hook_text is not None:
+        kwargs['hook_text'] = req.hook_text
+    clip = update_clip(clip_id, **kwargs) if kwargs else get_clip(clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return clip
+
+# ── Schedule Endpoints ────────────────────────────────────
+
+class BatchScheduleRequest(BaseModel):
+    clip_ids: List[str]
+    mode: str = "interval"  # "interval" or "exact"
+    start_from: Optional[str] = None  # ISO-8601 for interval mode
+    interval_hours: float = 4
+    timezone: str = "UTC"
+    title_template: Optional[str] = None  # Use #{n} for clip number
+    description: Optional[str] = None
+    privacy_status: str = "public"
+    youtube_refresh_token: Optional[str] = None
+    youtube_client_id: Optional[str] = None
+    youtube_client_secret: Optional[str] = None
+    # For exact mode
+    exact_schedules: Optional[List[dict]] = None  # [{"clip_id": "...", "scheduled_for": "..."}]
+
+def _clip_schedule_title(clip_dict: dict) -> str:
+    return clip_dict.get('title') or f"Clip #{clip_dict.get('clip_index', 0) + 1}"
+
+def _clip_schedule_description(clip_dict: dict) -> str:
+    parts = []
+    hook = clip_dict.get('hook_text')
+    if hook:
+        parts.append(hook)
+    desc_tiktok = clip_dict.get('description_tiktok')
+    if desc_tiktok:
+        parts.append(desc_tiktok)
+    desc_ig = clip_dict.get('description_instagram')
+    if desc_ig:
+        parts.append(desc_ig)
+    return '\n\n'.join(parts) if parts else ''
+
+@app.post("/api/schedules/batch")
+async def api_batch_schedule(req: BatchScheduleRequest):
+    from datetime import timedelta
+    created = []
+
+    def make_schedule(clip_id: str, scheduled_for: str, clip_dict: dict) -> Optional[dict]:
+        sid = str(uuid.uuid4())
+        return create_schedule(sid, clip_id, clip_dict['project_id'], scheduled_for,
+                               timezone=req.timezone,
+                               title=_clip_schedule_title(clip_dict),
+                               description=_clip_schedule_description(clip_dict),
+                               privacy_status=req.privacy_status,
+                               youtube_refresh_token=req.youtube_refresh_token or '',
+                               youtube_client_id=req.youtube_client_id or '',
+                               youtube_client_secret=req.youtube_client_secret or '')
+
+    if req.mode == "exact":
+        if not req.exact_schedules:
+            raise HTTPException(status_code=400, detail="exact_schedules required for exact mode")
+        for es in req.exact_schedules:
+            clip_id = es.get("clip_id")
+            scheduled_for = es.get("scheduled_for")
+            if not clip_id or not scheduled_for:
+                continue
+            conn = db_module.get_conn()
+            clip_row = conn.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
+            conn.close()
+            if not clip_row:
+                continue
+            clip_dict = dict(clip_row)
+            s = make_schedule(clip_id, scheduled_for, clip_dict)
+            if s:
+                created.append(s)
+    else:
+        # Interval mode
+        if not req.start_from:
+            raise HTTPException(status_code=400, detail="start_from required for interval mode")
+        base_dt = datetime.fromisoformat(req.start_from)
+        for i, clip_id in enumerate(req.clip_ids):
+            scheduled_for = (base_dt + timedelta(hours=req.interval_hours * i)).isoformat()
+            conn = db_module.get_conn()
+            clip_row = conn.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
+            conn.close()
+            if not clip_row:
+                continue
+            clip_dict = dict(clip_row)
+            s = make_schedule(clip_id, scheduled_for, clip_dict)
+            if s:
+                created.append(s)
+
+    return {"schedules": created}
+
+@app.get("/api/schedules")
+async def api_list_schedules(project_id: Optional[str] = None, status: Optional[str] = None,
+                              date_from: Optional[str] = None, date_to: Optional[str] = None):
+    schedules = list_schedules(project_id=project_id, status=status,
+                               date_from=date_from, date_to=date_to)
+    return {"schedules": schedules}
+
+@app.get("/api/schedules/calendar")
+async def api_calendar(date_from: str, date_to: str):
+    entries = get_calendar(date_from, date_to)
+    return {"entries": entries}
+
+@app.patch("/api/schedules/{schedule_id}")
+async def api_update_schedule(schedule_id: str,
+                               scheduled_for: Optional[str] = Form(None),
+                               title: Optional[str] = Form(None),
+                               description: Optional[str] = Form(None),
+                               privacy_status: Optional[str] = Form(None)):
+    kwargs = {}
+    if scheduled_for is not None:
+        kwargs['scheduled_for'] = scheduled_for
+    if title is not None:
+        kwargs['title'] = title
+    if description is not None:
+        kwargs['description'] = description
+    if privacy_status is not None:
+        kwargs['privacy_status'] = privacy_status
+    s = update_schedule(schedule_id, **kwargs)
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return s
+
+@app.delete("/api/schedules/{schedule_id}")
+async def api_delete_schedule(schedule_id: str):
+    ok = delete_schedule(schedule_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"success": True}
 
 # --- Thumbnail Studio Endpoints ---
 

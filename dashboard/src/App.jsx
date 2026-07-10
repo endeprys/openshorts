@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Type, Loader2 } from 'lucide-react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Type, Loader2, Folder } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import ModelSelector from './components/ModelSelector';
 import LanguageSelector from './components/LanguageSelector';
@@ -11,6 +11,10 @@ import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
+import ProjectsView from './components/ProjectsView';
+import ProjectDetail from './components/ProjectDetail';
+import ScheduleCalendar from './components/ScheduleCalendar';
+import { renderInBrowser } from './lib/renderInBrowser';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -185,7 +189,8 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [logsVisible, setLogsVisible] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings, projects, schedule
+  const [selectedProject, setSelectedProject] = useState(null);
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
@@ -214,9 +219,12 @@ function App() {
   const [showBatchYoutube, setShowBatchYoutube] = useState(false);
   const [batchSubtitleSettings, setBatchSubtitleSettings] = useState({
     position: 'bottom', font_size: 24, font_name: 'Verdana',
-    font_color: '#FFFFFF', border_color: '#000000', border_width: 2,
-    bg_color: '#000000', bg_opacity: 0.0
+    font_color: '#FFFFFF', highlight_color: '#FFDD00',
+    border_color: '#000000', border_width: 2,
+    bg_color: '#000000', bg_opacity: 0.0,
+    animation: 'pop'
   });
+  const [batchProgress, setBatchProgress] = useState(null); // { current, total, text }
   const [batchYoutubeSettings, setBatchYoutubeSettings] = useState({
     title: '', description: '', privacy_status: 'public'
   });
@@ -242,32 +250,110 @@ function App() {
   };
 
   const handleBatchSubtitle = async () => {
-    if (!jobId || selectedClips.size === 0) return;
+    if (!jobId || selectedClips.size === 0 || !results?.clips) return;
     setBatchProcessing(true);
-    setBatchResults(null);
-    try {
-      const res = await fetch(getApiUrl('/api/batch/subtitle'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          job_id: jobId,
-          clip_indices: Array.from(selectedClips),
-          ...batchSubtitleSettings
-        })
-      });
-      const data = await res.json();
-      setBatchResults(data.results);
-      if (jobId) {
-        const refreshed = await pollJob(jobId);
-        if (refreshed.status === 'complete' && refreshed.result) {
-          setResults(refreshed.result);
-        }
+    setBatchResults([]);
+    const indices = Array.from(selectedClips).sort((a, b) => a - b);
+    const total = indices.length;
+    const batchOutcomes = [];
+
+    for (let idx = 0; idx < indices.length; idx++) {
+      const clipIndex = indices[idx];
+      const clip = results.clips[clipIndex];
+      if (!clip) {
+        batchOutcomes.push({ clip_index: clipIndex, success: false, error: 'Clip not found' });
+        setBatchResults([...batchOutcomes]);
+        continue;
       }
-    } catch (e) {
-      setBatchResults([{ error: e.message }]);
-    } finally {
-      setBatchProcessing(false);
+
+      setBatchProgress({ current: idx + 1, total, text: `Fetching transcript for clip #${clipIndex + 1}...` });
+
+      try {
+        const transRes = await fetch(getApiUrl(`/api/clip/${jobId}/${clipIndex}/transcript`));
+        const transData = transRes.ok ? await transRes.json() : null;
+        const durationSec = transData?.durationSec || (clip.end ? clip.end - clip.start : 30);
+        const captions = transData?.captions || [];
+
+        setBatchProgress({ current: idx + 1, total, text: `Rendering subtitles on clip #${clipIndex + 1}...` });
+
+        const subtitleConfig = {
+          captions,
+          position: batchSubtitleSettings.position,
+          style: {
+            fontFamily: batchSubtitleSettings.font_name,
+            fontSize: batchSubtitleSettings.font_size * 2.2,
+            fontColor: batchSubtitleSettings.font_color,
+            highlightColor: batchSubtitleSettings.highlight_color,
+            borderColor: batchSubtitleSettings.border_color,
+            borderWidth: batchSubtitleSettings.border_width * 1.5,
+            bgColor: batchSubtitleSettings.bg_color,
+            bgOpacity: batchSubtitleSettings.bg_opacity,
+            animation: batchSubtitleSettings.animation,
+          },
+        };
+
+        const videoUrl = getApiUrl(clip.video_url);
+        const blobUrl = await renderInBrowser({
+          videoUrl,
+          durationInSeconds: durationSec,
+          subtitles: subtitleConfig,
+          hook: null,
+          effects: null,
+          onProgress: (p) => {
+            setBatchProgress({
+              current: idx + 1, total,
+              text: `Rendering clip #${clipIndex + 1}... ${Math.round(p * 100)}%`
+            });
+          },
+        });
+
+        setBatchProgress({ current: idx + 1, total, text: `Saving clip #${clipIndex + 1}...` });
+
+        const blobRes = await fetch(blobUrl);
+        const blob = await blobRes.blob();
+        const formData = new FormData();
+        formData.append('job_id', jobId);
+        formData.append('clip_index', clipIndex);
+        formData.append('file', blob, `clip-${clipIndex + 1}.mp4`);
+
+        const persistRes = await fetch(getApiUrl('/api/video/persist-blob'), {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!persistRes.ok) {
+          const errText = await persistRes.text();
+          throw new Error(errText);
+        }
+
+        const persistData = await persistRes.json();
+        const newUrl = persistData.video_url || clip.video_url;
+
+        setResults(prev => {
+          if (!prev?.clips?.[clipIndex]) return prev;
+          const updated = { ...prev };
+          updated.clips = [...updated.clips];
+          updated.clips[clipIndex] = { ...updated.clips[clipIndex], video_url: newUrl };
+          return updated;
+        });
+
+        batchOutcomes.push({ clip_index: clipIndex, success: true, new_video_url: newUrl });
+      } catch (e) {
+        batchOutcomes.push({ clip_index: clipIndex, success: false, error: e.message });
+      }
+      setBatchResults([...batchOutcomes]);
     }
+
+    setBatchProgress(null);
+    setBatchProcessing(false);
+
+    // Refresh job results
+    try {
+      const refreshed = await pollJob(jobId);
+      if (refreshed.status === 'complete' && refreshed.result) {
+        setResults(refreshed.result);
+      }
+    } catch {}
   };
 
   const handleBatchYoutubeUpload = async () => {
@@ -581,6 +667,22 @@ function App() {
         </button>
 
         <button
+          onClick={() => { setActiveTab('projects'); setSelectedProject(null); }}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'projects' ? 'bg-green-500/10 text-green-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <Folder size={20} />
+          <span className="font-medium hidden lg:block">Projects</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('schedule')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'schedule' ? 'bg-purple-500/10 text-purple-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <Calendar size={20} />
+          <span className="font-medium hidden lg:block">Schedule</span>
+        </button>
+
+        <button
           onClick={() => setActiveTab('ai-agent')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ai-agent' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
@@ -744,6 +846,29 @@ function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
+
+          {/* View: Projects */}
+          {activeTab === 'projects' && (
+            <div className="h-full overflow-y-auto animate-[fadeIn_0.3s_ease-out]">
+              {selectedProject ? (
+                <ProjectDetail
+                  project={selectedProject}
+                  onBack={() => setSelectedProject(null)}
+                />
+              ) : (
+                <ProjectsView
+                  onSelectProject={(p) => setSelectedProject(p)}
+                />
+              )}
+            </div>
+          )}
+
+          {/* View: Schedule */}
+          {activeTab === 'schedule' && (
+            <div className="h-full overflow-y-auto animate-[fadeIn_0.3s_ease-out]">
+              <ScheduleCalendar />
+            </div>
+          )}
 
           {/* View: Settings */}
           {activeTab === 'settings' && (
@@ -1494,7 +1619,7 @@ function App() {
       {showBatchSubtitle && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
           <div className="bg-[#121214] border border-white/10 p-6 rounded-2xl w-full max-w-lg shadow-2xl relative max-h-[90vh] overflow-y-auto">
-            <button onClick={() => { setShowBatchSubtitle(false); setBatchResults(null); }} className="absolute top-4 right-4 text-zinc-500 hover:text-white z-10">
+            <button onClick={() => { setShowBatchSubtitle(false); setBatchResults(null); setBatchProgress(null); }} className="absolute top-4 right-4 text-zinc-500 hover:text-white z-10">
               <X size={20} />
             </button>
             <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
@@ -1503,6 +1628,20 @@ function App() {
             <p className="text-xs text-zinc-500 mb-4">Applying subtitles to <strong className="text-zinc-300">{selectedClips.size}</strong> selected clips</p>
 
             <div className="space-y-4">
+              {/* Progress bar */}
+              {batchProgress && (
+                <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-4 space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-blue-300">{batchProgress.text}</span>
+                    <span className="text-zinc-500">{batchProgress.current}/{batchProgress.total}</span>
+                  </div>
+                  <div className="w-full bg-white/5 rounded-full h-1.5 overflow-hidden">
+                    <div className="bg-blue-500 h-full rounded-full transition-all duration-300"
+                      style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }} />
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Position</label>
                 <div className="grid grid-cols-3 gap-2">
@@ -1515,6 +1654,20 @@ function App() {
                 </div>
               </div>
 
+              {/* Animation */}
+              <div>
+                <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Animation</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {[{ value: 'pop', label: 'Pop' }, { value: 'word-highlight', label: 'Glow' },
+                    { value: 'karaoke', label: 'Karaoke' }, { value: 'none', label: 'None' }].map(opt => (
+                    <button key={opt.value} onClick={() => setBatchSubtitleSettings(s => ({ ...s, animation: opt.value }))}
+                      className={`p-2 rounded-lg border text-center text-xs font-medium transition-all ${batchSubtitleSettings.animation === opt.value ? 'bg-primary/20 border-primary text-white' : 'bg-white/5 border-white/5 text-zinc-400 hover:bg-white/10'}`}>
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div>
                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font Size: {batchSubtitleSettings.font_size}px</label>
                 <input type="range" min="12" max="48" value={batchSubtitleSettings.font_size}
@@ -1522,15 +1675,21 @@ function App() {
                   className="w-full accent-primary" />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font Color</label>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font</label>
                   <input type="color" value={batchSubtitleSettings.font_color}
                     onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, font_color: e.target.value }))}
                     className="w-full h-8 rounded-lg bg-transparent border border-white/10 cursor-pointer" />
                 </div>
                 <div>
-                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Border Color</label>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Highlight</label>
+                  <input type="color" value={batchSubtitleSettings.highlight_color}
+                    onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, highlight_color: e.target.value }))}
+                    className="w-full h-8 rounded-lg bg-transparent border border-white/10 cursor-pointer" />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Border</label>
                   <input type="color" value={batchSubtitleSettings.border_color}
                     onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, border_color: e.target.value }))}
                     className="w-full h-8 rounded-lg bg-transparent border border-white/10 cursor-pointer" />
@@ -1547,16 +1706,15 @@ function App() {
               <button onClick={handleBatchSubtitle} disabled={batchProcessing}
                 className="w-full py-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 text-black font-bold rounded-xl shadow-lg shadow-orange-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-50">
                 {batchProcessing ? <Loader2 size={20} className="animate-spin" /> : <Type size={20} />}
-                {batchProcessing ? 'Processing...' : `Apply Subtitles to ${selectedClips.size} Clips`}
+                {batchProcessing ? 'Rendering...' : `Apply Subtitles to ${selectedClips.size} Clips`}
               </button>
 
-              {batchResults && (
+              {batchResults && batchResults.length > 0 && (
                 <div className="mt-4 space-y-1.5 max-h-40 overflow-y-auto custom-scrollbar">
                   {batchResults.map((r, i) => (
                     <div key={i} className={`flex items-center gap-2 text-xs ${r.success ? 'text-green-400' : 'text-red-400'}`}>
                       {r.success ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
                       Clip #{r.clip_index + 1}: {r.success ? 'OK' : r.error}
-                      {r.success && r.new_video_url && <span className="text-zinc-500 ml-auto">subtitled</span>}
                     </div>
                   ))}
                 </div>
@@ -1589,21 +1747,6 @@ function App() {
               </div>
             ) : (
               <div className="space-y-4">
-                <div>
-                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Title template</label>
-                  <input type="text" value={batchYoutubeSettings.title}
-                    onChange={(e) => setBatchYoutubeSettings(s => ({ ...s, title: e.target.value }))}
-                    placeholder="My Viral Video # (auto-numbered)"
-                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50" />
-                  <p className="text-[10px] text-zinc-600 mt-1">A clip number will be appended automatically (e.g. "My Video #1")</p>
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Description (shared)</label>
-                  <textarea value={batchYoutubeSettings.description}
-                    onChange={(e) => setBatchYoutubeSettings(s => ({ ...s, description: e.target.value }))}
-                    rows={3} placeholder="Common description for all clips..."
-                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50 resize-none" />
-                </div>
                 <div>
                   <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Privacy</label>
                   <div className="grid grid-cols-3 gap-2">

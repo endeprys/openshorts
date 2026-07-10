@@ -24,6 +24,11 @@
 | **Retry при ошибках API** | Автоматические повторные попытки при 429 (rate limit) и 503 Gemini с exponential backoff. Интерфейс повторного запуска AI после неудачи. |
 | **Прямая выгрузка на YouTube** | Выкладка видео напрямую через YouTube Data API v3 (OAuth 2.0, resumable upload). Без сторонних платных сервисов вроде Upload-Post. Никаких ограничений по количеству видео. |
 | **Публикация blob-видео** | Возможность постить в соцсети видео, отрендеренные в браузере (с сохранением на сервер). |
+| **Персистентные проекты и клипы** | SQLite-база данных: проекты сохраняются между перезапусками, клипы привязаны к проектам, всё доступно через вкладку Projects. |
+| **Календарь YouTube-выкладок** | Планирование публикаций через интервальный (каждые N часов) или точный (дата/время для каждого клипа) режимы. Фоновый диспетчер автоматически выгружает в срок. |
+| **Анимированные субтитры (Remotion)** | 4 стиля анимации: Pop (пружинистый скейл), Glow (свечение), Karaoke (подсветка слов) и None. Рендер через @remotion/web-renderer в браузере. Те же эффекты, что и в превью. |
+| **Групповые операции** | Батч-субтитры, батч-выгрузка на YouTube, батч-планирование в календарь — для нескольких клипов одновременно. |
+| **Редактирование клипов** | Изменение заголовка, hook-текста, TikTok/Instagram описаний прямо из ProjectDetail. |
 
 **Free & open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**. Self-hosted with Docker. No watermarks, no limits.
 
@@ -83,10 +88,14 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 ### Clip Generator
 - **Viral Moment Detection**: Google Gemini 3.0 Flash analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
 - **Smart 9:16 Cropping**: Dual-mode AI reframing — TRACK mode (MediaPipe + YOLOv8 face tracking) and GENERAL mode (blurred background)
-- **Auto Subtitles**: faster-whisper with word-level timestamps, styled and burned into clips
+- **Animated Subtitles (Remotion)**: 4 animation styles — Pop (spring scale), Glow (text shadow), Karaoke (word highlight), None. Rendered in-browser via @remotion/web-renderer at 1080×1920 with H.264 + AAC
+- **Batch Subtitles**: Apply animated subtitles to multiple clips at once with live Remotion rendering and per-clip progress
 - **AI Voice Dubbing**: ElevenLabs integration for 30+ languages with voice cloning
 - **Hook Text Overlays**: AI-generated attention-grabbing text overlays
 - **AI Video Effects**: Gemini-generated FFmpeg filters for professional effects
+- **Persistent Project Library**: All clips saved to SQLite with generated titles, descriptions (TikTok/Instagram), hook texts. Editable from the Projects tab.
+- **YouTube Scheduling Calendar**: Plan uploads in interval mode (every N hours) or exact mode (per-clip datetime). Background dispatcher auto-uploads at the scheduled time.
+- **Batch YouTube Upload & Schedule**: Upload or schedule multiple clips at once with auto-filled titles and descriptions from AI-generated metadata.
 
 ### AI Shorts Pipeline
 1. **Analyze**: Scrape website URL + web research, or generate from manual description
@@ -228,11 +237,13 @@ Navigate to **`http://localhost:5175`**
 1. **Ingest** — Local video upload (or self-hosted URL ingest via yt-dlp)
 2. **Transcribe** — faster-whisper with word-level timestamps
 3. **Detect** — PySceneDetect for scene boundaries
-4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each)
+4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each) via chunked transcript analysis
 5. **Extract** — FFmpeg precise clip cutting
-6. **Reframe** — AI vertical cropping with subject tracking
-7. **Effects** — Subtitles, hooks, AI video effects
-8. **Publish** — S3 backup + Upload-Post social distribution
+6. **Reframe** — AI vertical cropping with subject tracking (TRACK / GENERAL modes)
+7. **Save** — Project + clips persisted to SQLite database with AI-generated titles, hook texts, platform descriptions
+8. **Effects** — Animated subtitles (Remotion browser render), hook overlays, AI video effects
+9. **Batch Operations** — Batch subtitles, batch YouTube upload, batch calendar scheduling
+10. **Publish** — S3 backup + YouTube Data API v3 (direct) + Upload-Post social distribution
 
 ### AI Shorts
 1. **Analyze** — Website scraping + Gemini web research (or manual description)
@@ -252,10 +263,11 @@ Navigate to **`http://localhost:5175`**
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.11, FastAPI, google-genai, faster-whisper, ultralytics (YOLOv8), mediapipe, opencv-python, yt-dlp, FFmpeg, httpx |
-| Frontend | React 18, Vite 4, Tailwind CSS 3.4 |
+| Frontend | React 18, Vite 4, Tailwind CSS 3.4, Remotion (@remotion/player, @remotion/web-renderer, @remotion/renderer) |
+| Database | SQLite (persistent projects, clips, schedules) |
 | AI APIs | Google Gemini, fal.ai (Flux, Hailuo, VEED, Kling), ElevenLabs |
 | Infrastructure | Docker + Docker Compose, AWS S3 |
-| Publishing | Upload-Post API (TikTok, Instagram, YouTube) |
+| Publishing | YouTube Data API v3 (direct OAuth 2.0), Upload-Post API (TikTok, Instagram, YouTube) |
 
 ---
 
@@ -285,7 +297,8 @@ Navigate to **`http://localhost:5175`**
 
 - **Non-Root Execution**: Containers run as dedicated `appuser`
 - **Concurrency Control**: Semaphore-based job queue (`MAX_CONCURRENT_JOBS`)
-- **Auto-Cleanup**: Automatic purging of old jobs (1h retention)
+- **Auto-Cleanup**: Automatic purging of old job directories (1h retention)
+- **Persistent Database**: SQLite with WAL mode, foreign keys, and automatic schema creation
 - **Encrypted Keys**: API keys encrypted client-side, never stored server-side
 - **Upload Validation**: Image uploads validated for format and minimum size
 - **File Limits**: 2GB upload limit protection

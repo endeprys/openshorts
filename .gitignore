@@ -30,6 +30,9 @@ output/
 # Generated metadata
 *_metadata.json
 
+# Database
+data/
+
 # Cache dirs
 .cache/
 .config/
