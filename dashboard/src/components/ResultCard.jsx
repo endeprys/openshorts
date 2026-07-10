@@ -322,6 +322,32 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             return;
         }
 
+        // If current video is a browser-rendered blob, persist it to server first
+        if (currentVideoUrl.startsWith('blob:')) {
+            try {
+                const blobRes = await fetch(currentVideoUrl);
+                const blob = await blobRes.blob();
+                const formData = new FormData();
+                formData.append('job_id', jobId);
+                formData.append('clip_index', index);
+                formData.append('file', blob, `clip-${index + 1}.mp4`);
+
+                const persistRes = await fetch(getApiUrl('/api/video/persist-blob'), {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!persistRes.ok) {
+                    const errText = await persistRes.text();
+                    setPostResult({ success: false, msg: `Failed to save rendered video: ${errText}` });
+                    return;
+                }
+            } catch (e) {
+                setPostResult({ success: false, msg: `Failed to save rendered video: ${e.message}` });
+                return;
+            }
+        }
+
         // YouTube direct upload (no Upload-Post needed)
         const wantsYoutube = selectedPlatforms.includes('youtube');
         const wantsOther = selectedPlatforms.some(p => p !== 'youtube');

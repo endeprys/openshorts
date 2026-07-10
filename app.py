@@ -188,6 +188,7 @@ app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails
 
 class ProcessRequest(BaseModel):
     url: str
+    model: Optional[str] = None
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -269,7 +270,21 @@ async def run_job(job_id, job_data):
 
         returncode = process.returncode
         
-        if returncode == 0:
+        # Check if AI needs retry (detect marker in logs)
+        ai_retry_log = None
+        for log_line in jobs[job_id].get('logs', []):
+            if 'AI_NEEDS_RETRY' in log_line:
+                ai_retry_log = log_line
+                break
+        
+        if ai_retry_log:
+            jobs[job_id]['status'] = 'ai_needs_retry'
+            jobs[job_id]['logs'].append("AI analysis failed. Waiting for model selection to retry.")
+            retry_file = os.path.join(output_dir, ".ai_retry_data.json")
+            if os.path.exists(retry_file):
+                with open(retry_file, 'r') as f:
+                    jobs[job_id]['retry_data'] = json.load(f)
+        elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
@@ -313,12 +328,31 @@ async def run_job(job_id, job_data):
 async def get_config():
     return {"youtubeUrlEnabled": not DISABLE_YOUTUBE_URL}
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+@app.get("/api/ollama/models")
+async def ollama_models():
+    """Fetch available models from Ollama."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m["name"] for m in data.get("models", [])]
+                return {"models": models, "connected": True}
+    except Exception as e:
+        print(f"⚠️ Ollama not available: {e}")
+    return {"models": [], "connected": False}
+
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
-    acknowledged: Optional[str] = Form(None)
+    acknowledged: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    lang: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
@@ -332,6 +366,11 @@ async def process_endpoint(
         body = await request.json()
         url = body.get("url")
         ack_flag = bool(body.get("acknowledged"))
+        model = body.get("model") or model
+        lang = body.get("lang") or lang
+    else:
+        model = model or request.headers.get("X-Gemini-Model")
+        lang = lang or request.headers.get("X-Gemini-Lang")
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -364,6 +403,14 @@ async def process_endpoint(
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
+
+    if model:
+        env["GEMINI_MODEL_NAME"] = model
+        cmd.extend(["--model", model])
+        cmd.extend(["--no-fallback"])
+    if lang:
+        env["OUTPUT_LANGUAGE"] = lang
+        cmd.extend(["--lang", lang])
 
     if url:
         cmd.extend(["-u", url])
@@ -413,7 +460,156 @@ async def get_status(job_id: str):
     return {
         "status": job['status'],
         "logs": job['logs'],
-        "result": job.get('result')
+        "result": job.get('result'),
+        "retry_data": job.get('retry_data')
+    }
+
+class RetryAIRequest(BaseModel):
+    job_id: str
+    model: str
+    lang: Optional[str] = None
+
+@app.post("/api/retry-ai")
+async def retry_ai_analysis(
+    req: RetryAIRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+):
+    """Retry AI analysis with a different model after a failed attempt."""
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[req.job_id]
+    if job['status'] != 'ai_needs_retry':
+        raise HTTPException(status_code=400, detail="Job is not in retry state")
+    
+    retry_data = job.get('retry_data')
+    if not retry_data:
+        raise HTTPException(status_code=400, detail="No retry data available")
+    
+    output_dir = job['output_dir']
+    input_video = retry_data.get('input_video')
+    transcript = retry_data.get('transcript')
+    duration = retry_data.get('duration')
+    video_title = retry_data.get('video_title')
+    
+    if not input_video or not os.path.exists(input_video):
+        raise HTTPException(status_code=404, detail="Original video file not found")
+    
+    api_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
+    
+    # Run AI analysis in thread pool
+    def run_retry():
+        from main import get_viral_clips
+        
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
+        if req.lang:
+            os.environ["OUTPUT_LANGUAGE"] = req.lang
+        
+        clips_data = get_viral_clips(transcript, duration, model_name=req.model)
+        return clips_data
+    
+    loop = asyncio.get_event_loop()
+    clips_data = await loop.run_in_executor(None, run_retry)
+    
+    if not clips_data or 'shorts' not in clips_data:
+        # Update last model in retry data
+        if os.path.exists(os.path.join(output_dir, ".ai_retry_data.json")):
+            retry_data['last_model'] = req.model
+            with open(os.path.join(output_dir, ".ai_retry_data.json"), 'w') as f:
+                json.dump(retry_data, f, indent=2)
+            job['retry_data'] = retry_data
+        
+        return {
+            "success": False,
+            "error": f"AI analysis failed with model '{req.model}'",
+            "status": "ai_needs_retry"
+        }
+    
+    # Success! Save metadata and start clip processing
+    clips_data['transcript'] = transcript
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    with open(metadata_file, 'w') as f:
+        json.dump(clips_data, f, indent=2)
+    
+    # Remove retry file
+    retry_file = os.path.join(output_dir, ".ai_retry_data.json")
+    if os.path.exists(retry_file):
+        os.remove(retry_file)
+    
+    # Update job status back to processing for clip extraction
+    job['status'] = 'ai_retry_complete'
+    job['retry_data'] = None
+    
+    # Start background clip processing
+    async def process_clips_after_retry():
+        from main import process_video_to_vertical
+        import shutil
+        
+        clips = clips_data.get('shorts', [])
+        for i, clip in enumerate(clips):
+            start = clip['start']
+            end = clip['end']
+            print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+            
+            clip_filename = f"{video_title}_clip_{i+1}.mp4"
+            clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+            clip_final_path = os.path.join(output_dir, clip_filename)
+            
+            cut_command = [
+                'ffmpeg', '-y',
+                '-ss', str(start),
+                '-to', str(end),
+                '-i', input_video,
+                '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+                '-c:a', 'aac',
+                '-movflags', '+faststart',
+                clip_temp_path
+            ]
+            subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            
+            success = process_video_to_vertical(clip_temp_path, clip_final_path)
+            if success:
+                print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+            
+            if os.path.exists(clip_temp_path):
+                os.remove(clip_temp_path)
+            
+            # Update job logs
+            if req.job_id in jobs:
+                jobs[req.job_id]['logs'].append(f"✅ Clip {i+1}/{len(clips)} processed")
+        
+        # Clean up uploaded video if it was from YouTube
+        if job.get('attestation', {}).get('source') == 'url':
+            if os.path.exists(input_video):
+                os.remove(input_video)
+        
+        # Update final status
+        if req.job_id in jobs:
+            jobs[req.job_id]['status'] = 'completed'
+            jobs[req.job_id]['logs'].append("All clips processed successfully!")
+            
+            # Build result
+            base_name = video_title
+            result_clips = []
+            for i, clip in enumerate(clips):
+                clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                clip_path = os.path.join(output_dir, clip_filename)
+                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                    clip['video_url'] = f"/videos/{req.job_id}/{clip_filename}"
+                    result_clips.append(clip)
+            
+            jobs[req.job_id]['result'] = {
+                'clips': result_clips,
+                'cost_analysis': clips_data.get('cost_analysis')
+            }
+    
+    asyncio.create_task(process_clips_after_retry())
+    
+    return {
+        "success": True,
+        "clips_count": len(clips_data.get('shorts', [])),
+        "status": "processing"
     }
 
 from editor import VideoEditor
@@ -428,6 +624,7 @@ class EditRequest(BaseModel):
     clip_index: int
     api_key: Optional[str] = None
     input_filename: Optional[str] = None
+    model: Optional[str] = None
 
 @app.post("/api/edit")
 async def edit_clip(
@@ -467,10 +664,12 @@ async def edit_clip(
         edited_filename = f"edited_{filename}"
         output_path = os.path.join(OUTPUT_DIR, req.job_id, edited_filename)
         
+        model_name = req.model or os.environ.get("GEMINI_MODEL_NAME")
+
         # Run editing in a thread to avoid blocking main loop
         # Since VideoEditor uses blocking calls (subprocess, API wait)
         def run_edit():
-            editor = VideoEditor(api_key=final_api_key)
+            editor = VideoEditor(api_key=final_api_key, model_name=model_name)
             
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
             # Create a safe ASCII filename in the same directory
@@ -644,6 +843,7 @@ class EffectsGenerateRequest(BaseModel):
     job_id: str
     clip_index: int
     input_filename: Optional[str] = None
+    model: Optional[str] = None
 
 @app.post("/api/effects/generate")
 async def generate_effects_config(
@@ -676,8 +876,10 @@ async def generate_effects_config(
         if not os.path.exists(input_path):
             raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
+        model_name = req.model or os.environ.get("GEMINI_MODEL_NAME")
+
         def run_effects_generation():
-            editor = VideoEditor(api_key=final_api_key)
+            editor = VideoEditor(api_key=final_api_key, model_name=model_name)
 
             # Create safe ASCII filename to avoid encoding issues
             safe_filename = f"temp_effects_{req.job_id}.mp4"
@@ -748,6 +950,52 @@ async def generate_effects_config(
     except Exception as e:
         print(f"❌ Effects Generation Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/video/persist-blob")
+async def persist_blob_video(
+    job_id: str = Form(...),
+    clip_index: int = Form(...),
+    file: UploadFile = File(...)
+):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    if 'result' not in job or 'clips' not in job['result']:
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    if clip_index >= len(job['result']['clips']):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    contents = await file.read()
+
+    timestamp = int(time.time())
+    filename = f"browser_rendered_{clip_index}_{timestamp}.mp4"
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    file_path = os.path.join(output_dir, filename)
+
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    video_url = f"/videos/{job_id}/{filename}"
+    job['result']['clips'][clip_index]['video_url'] = video_url
+
+    try:
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if json_files:
+            with open(json_files[0], 'r') as f:
+                data = json.load(f)
+            clips = data.get('shorts', [])
+            if clip_index < len(clips):
+                clips[clip_index]['video_url'] = video_url
+                data['shorts'] = clips
+                with open(json_files[0], 'w') as f:
+                    json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"⚠️ Failed to update metadata.json: {e}")
+
+    return {"success": True, "video_url": video_url}
 
 
 @app.post("/api/subtitle")

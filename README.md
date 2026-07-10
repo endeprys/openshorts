@@ -9,6 +9,23 @@
 
 **Free & open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**. Self-hosted with Docker. No watermarks, no limits.
 
+---
+
+## Отличия от оригинала (OpenShorts.app)
+
+Этот форк [оригинального OpenShorts](https://github.com/mutonby/openshorts) содержит следующие улучшения:
+
+| Изменение | Описание |
+|-----------|----------|
+| **GPU-ускорение в Docker** | Base image заменён на `nvidia/cuda:12.8.1-runtime-ubuntu22.04`, PyTorch 2.11.0+cu128. Поддержка RTX 50xx (Blackwell, sm\_120). CUDA доступна внутри контейнера. |
+| **Поддержка Ollama** | AI-анализ виральных моментов может работать через локальный Ollama (любая модель). Префикс `ollama:` в имени модели. Эндпоинт `GET /api/ollama/models` для авто-обнаружения. |
+| **Мультиязычный вывод** | Параметр `--lang` / переменная `OUTPUT_LANGUAGE`. Заголовки, описания и hook-тексты генерируются на указанном языке (15 языков, включая русский, казахский, украинский). |
+| **Выбор модели Gemini** | Все модули читают модель из `GEMINI_MODEL_NAME` (env-var). UI-селектор моделей Gemini 3/2.5/2.0 Flash/Pro. |
+| **Retry при ошибках API** | Автоматические повторные попытки при 429 (rate limit) и 503 Gemini с exponential backoff. Интерфейс повторного запуска AI после неудачи. |
+| **Публикация blob-видео** | Возможность постить в соцсети видео, отрендеренные в браузере (с сохранением на сервер). |
+
+**Free & open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**. Self-hosted with Docker. No watermarks, no limits.
+
 https://github.com/user-attachments/assets/b45fa983-16b4-48b5-ac5b-a267836b9ad9
 
 

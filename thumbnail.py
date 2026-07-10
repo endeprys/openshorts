@@ -7,6 +7,9 @@ from google.genai import types
 from PIL import Image
 
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL_NAME", "gemini-3.1-flash-image-preview")
+
 def analyze_video_for_titles(api_key, video_path, transcript=None):
     """
     Transcribes a video and uses Gemini to suggest viral YouTube titles.
@@ -65,7 +68,7 @@ OUTPUT JSON:
 
     print("🤖 [Thumbnail] Asking Gemini for title suggestions...")
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL,
         contents=[file_upload, prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
@@ -143,12 +146,14 @@ OUTPUT JSON:
 }}"""
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL,
         contents=[prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
         )
     )
+
+
 
     try:
         text = response.text.strip()
@@ -241,7 +246,7 @@ DESIGN REQUIREMENTS:
         print(f"🎨 [Thumbnail] Generating thumbnail {i + 1}/{count}...")
         try:
             response = client.models.generate_content(
-                model="gemini-3.1-flash-image-preview",
+                model=GEMINI_IMAGE_MODEL,
                 contents=prompt_parts,
                 config=types.GenerateContentConfig(
                     response_modalities=["TEXT", "IMAGE"],
@@ -322,7 +327,7 @@ OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code bloc
 
     print("🤖 [Thumbnail] Generating YouTube description with chapters...")
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL,
         contents=[prompt],
     )
 

@@ -18,6 +18,7 @@ import mediapipe as mp
 from google import genai
 from dotenv import load_dotenv
 import json
+import httpx
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -52,16 +53,22 @@ STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
 - No clips < 15 s or > 60 s.
 
-OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
+LANGUAGE REQUIREMENT:
+- Write ALL titles, descriptions, hook texts and any output text IN THIS LANGUAGE: {output_language}
+- The viral_hook_text must be punchy and engaging in {output_language}
+- The descriptions must include a CTA appropriate for {output_language} culture
+- Examples of CTAs in {output_language}: if English use "Follow me and comment X", if Russian use "Подпишись и напиши X", etc.
+
+OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst):
 {{
   "shorts": [
     {{
       "start": <number in seconds, e.g., 12.340>,
       "end": <number in seconds, e.g., 37.900>,
-      "video_description_for_tiktok": "<description for TikTok oriented to get views>",
-      "video_description_for_instagram": "<description for Instagram oriented to get views>",
-      "video_title_for_youtube_short": "<title for YouTube Short oriented to get views 100 chars max>",
-      "viral_hook_text": "<SHORT punchy text overlay (max 10 words). MUST BE IN THE SAME LANGUAGE AS THE VIDEO TRANSCRIPT. Examples: 'POV: You realized...', 'Did you know?', 'Stop doing this!'>"
+      "video_description_for_tiktok": "<description for TikTok in {output_language}>",
+      "video_description_for_instagram": "<description for Instagram in {output_language}>",
+      "video_title_for_youtube_short": "<title for YouTube Short in {output_language} 100 chars max>",
+      "viral_hook_text": "<SHORT punchy text overlay (max 10 words) in {output_language}>"
     }}
   ]
 }}
@@ -806,21 +813,87 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def get_viral_clips(transcript_result, video_duration):
-    print("🤖  Analyzing with Gemini...")
+def call_ollama(model_name, prompt, video_duration):
+    """Call Ollama API for viral clip analysis."""
+    ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model = model_name.replace("ollama:", "", 1)
     
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
-        return None
+    print(f"🦙 Calling Ollama with model: {ollama_model}")
+    
+    system_prompt = "You are a senior short-form video editor. You MUST respond with VALID JSON only, no markdown, no explanations."
+    
+    payload = {
+        "model": ollama_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.1
+        },
+        "format": "json"
+    }
+    
+    max_retries = 3
+    base_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(f"{ollama_base}/api/chat", json=payload)
+                
+            if resp.status_code != 200:
+                print(f"❌ Ollama Error ({resp.status_code}): {resp.text}")
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"⏳ Retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                return None
+            
+            data = resp.json()
+            content = data.get("message", {}).get("content", "")
+            
+            if not content:
+                print("❌ Ollama returned empty response")
+                return None
+            
+            text = content.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            
+            result = json.loads(text)
+            result['cost_analysis'] = {
+                "model": f"ollama:{ollama_model}",
+                "provider": "ollama",
+                "total_cost": 0
+            }
+            print(f"🔥 Ollama identified {len(result.get('shorts', []))} viral clips!")
+            return result
+            
+        except httpx.TimeoutException:
+            print(f"⏳ Ollama timeout. Retrying... (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+        except json.JSONDecodeError as e:
+            print(f"❌ Ollama JSON parse error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Ollama error: {e}")
+            return None
+    
+    return None
 
 
-    client = genai.Client(api_key=api_key)
-    
-    # We use gemini-2.5-flash as requested.
-    model_name = 'gemini-2.5-flash' 
-    
-    print(f"🤖  Initializing Gemini with model: {model_name}")
+def get_viral_clips(transcript_result, video_duration, model_name=None):
+    if not model_name:
+        model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
     # Extract words
     words = []
@@ -832,71 +905,103 @@ def get_viral_clips(transcript_result, video_duration):
                 'e': word['end']
             })
 
+    output_language = os.getenv("OUTPUT_LANGUAGE", "English")
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
         transcript_text=json.dumps(transcript_result['text']),
-        words_json=json.dumps(words)
+        words_json=json.dumps(words),
+        output_language=output_language
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
-        
-        # --- Cost Calculation ---
-        try:
-            usage = response.usage_metadata
-            if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
-                
-                input_price_per_million = 0.10
-                output_price_per_million = 0.40
-                
-                prompt_tokens = usage.prompt_token_count
-                output_tokens = usage.candidates_token_count
-                
-                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-                output_cost = (output_tokens / 1_000_000) * output_price_per_million
-                total_cost = input_cost + output_cost
-                
-                cost_analysis = {
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                    "input_cost": input_cost,
-                    "output_cost": output_cost,
-                    "total_cost": total_cost,
-                    "model": model_name
-                }
+    # Route to Ollama if model starts with ollama:
+    if model_name.startswith("ollama:"):
+        return call_ollama(model_name, prompt, video_duration)
 
-                print(f"💰 Token Usage ({model_name}):")
-                print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
-                print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
-                print(f"   - Total Estimated Cost: ${total_cost:.6f}")
-                
-        except Exception as e:
-            print(f"⚠️ Could not calculate cost: {e}")
-            cost_analysis = None
-        # ------------------------
-
-        # Clean response if it contains markdown code blocks
-        text = response.text
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        result_json = json.loads(text)
-        if cost_analysis:
-            result_json['cost_analysis'] = cost_analysis
-            
-        return result_json
-    except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+    # Gemini path
+    print("🤖  Analyzing with Gemini...")
+    
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
         return None
+
+    client = genai.Client(api_key=api_key)
+    
+    print(f"🤖  Initializing Gemini with model: {model_name}")
+
+    max_retries = 5
+    base_delay = 5
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            
+            # --- Cost Calculation ---
+            try:
+                usage = response.usage_metadata
+                if usage:
+                    input_price_per_million = 0.10
+                    output_price_per_million = 0.40
+                    
+                    prompt_tokens = usage.prompt_token_count
+                    output_tokens = usage.candidates_token_count
+                    
+                    input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                    output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                    total_cost = input_cost + output_cost
+                    
+                    cost_analysis = {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "input_cost": input_cost,
+                        "output_cost": output_cost,
+                        "total_cost": total_cost,
+                        "model": model_name
+                    }
+
+                    print(f"💰 Token Usage ({model_name}):")
+                    print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
+                    print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
+                    print(f"   - Total Estimated Cost: ${total_cost:.6f}")
+                    
+            except Exception as e:
+                print(f"⚠️ Could not calculate cost: {e}")
+                cost_analysis = None
+            # ------------------------
+
+            # Clean response if it contains markdown code blocks
+            text = response.text
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            
+            result_json = json.loads(text)
+            if cost_analysis:
+                result_json['cost_analysis'] = cost_analysis
+                
+            return result_json
+
+        except Exception as e:
+            error_str = str(e)
+            is_retryable = any(x in error_str for x in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"])
+            if is_retryable:
+                import re
+                delay_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+                delay = float(delay_match.group(1)) if delay_match else base_delay * (2 ** attempt)
+                code = "429" if "429" in error_str else "503"
+                print(f"⏳ Gemini {code}. Retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                print(f"❌ Gemini Error: {e}")
+                return None
+    
+    print(f"❌ Gemini failed after {max_retries} retries.")
+    return None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
@@ -908,6 +1013,9 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--model', type=str, help="Gemini or Ollama model name (prefix ollama: for Ollama). Can also be set via GEMINI_MODEL_NAME env var.")
+    parser.add_argument('--no-fallback', action='store_true', help="If AI analysis fails, save transcript for retry instead of processing whole video.")
+    parser.add_argument('--lang', type=str, default="English", help="Output language for titles, descriptions and hooks (default: English). Examples: Russian, Spanish, French, etc.")
     
     args = parser.parse_args()
 
@@ -971,13 +1079,32 @@ if __name__ == '__main__':
         duration = frame_count / fps
         cap.release()
 
-        # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
+        # 4. AI Analysis
+        model_name = args.model or os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+        output_language = args.lang or os.getenv("OUTPUT_LANGUAGE", "English")
+        os.environ["OUTPUT_LANGUAGE"] = output_language
+        clips_data = get_viral_clips(transcript, duration, model_name=model_name)
         
         if not clips_data or 'shorts' not in clips_data:
-            print("❌ Failed to identify clips. Converting whole video as fallback.")
-            output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
-            process_video_to_vertical(input_video, output_file)
+            if args.no_fallback:
+                print(f"⚠️ AI analysis failed with model '{model_name}'. Saving transcript for retry.")
+                retry_file = os.path.join(output_dir, ".ai_retry_data.json")
+                retry_data = {
+                    "transcript": transcript,
+                    "duration": duration,
+                    "video_title": video_title,
+                    "last_model": model_name,
+                    "input_video": input_video
+                }
+                with open(retry_file, 'w') as f:
+                    json.dump(retry_data, f, indent=2)
+                print(f"   Retry data saved to {retry_file}")
+                print(f"🔴 AI_NEEDS_RETRY model={model_name}")
+                exit(0)
+            else:
+                print("❌ Failed to identify clips. Converting whole video as fallback.")
+                output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
+                process_video_to_vertical(input_video, output_file)
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             

@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { Youtube, Upload, FileVideo, X } from 'lucide-react';
 import { getApiUrl } from '../config';
+import ModelSelector from './ModelSelector';
+import LanguageSelector from './LanguageSelector';
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, isProcessing, model, onModelChange, lang, onLangChange }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [mode, setMode] = useState('url'); // 'url' | 'file'
     const [url, setUrl] = useState('');
@@ -112,6 +114,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         )}
                     </div>
                 )}
+
+                <div className="mt-5 flex gap-3">
+                    <div className="flex-1">
+                        <label className="text-xs text-zinc-500 mb-1.5 block">AI Model</label>
+                        <ModelSelector model={model} onModelChange={onModelChange} />
+                    </div>
+                    <div className="flex-1">
+                        <label className="text-xs text-zinc-500 mb-1.5 block">Output Language</label>
+                        <LanguageSelector lang={lang} onLangChange={onLangChange} />
+                    </div>
+                </div>
 
                 <label className="flex items-start gap-2 mt-5 text-xs text-zinc-400 cursor-pointer select-none">
                     <input

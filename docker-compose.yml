@@ -8,6 +8,8 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
     restart: unless-stopped
     deploy:
       resources:

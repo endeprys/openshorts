@@ -33,6 +33,7 @@ output/
 # Cache dirs
 .cache/
 .config/
+.nv/
 # Multi-agent Skills
 .agents/
 .agent/

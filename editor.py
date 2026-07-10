@@ -7,9 +7,33 @@ from google import genai
 from google.genai import types
 
 class VideoEditor:
-    def __init__(self, api_key):
+    def __init__(self, api_key, model_name=None):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3-flash-preview" 
+        self.model_name = model_name or os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")
+
+    def _generate_with_retry(self, model, contents, config=None):
+        max_retries = 5
+        base_delay = 5
+        for attempt in range(max_retries):
+            try:
+                return self.client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                error_str = str(e)
+                is_retryable = any(x in error_str for x in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"])
+                if is_retryable:
+                    import re
+                    delay_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+                    delay = float(delay_match.group(1)) if delay_match else base_delay * (2 ** attempt)
+                    code = "429" if "429" in error_str else "503"
+                    print(f"⏳ Gemini {code}. Retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    raise e
+        raise Exception(f"Gemini API failed after {max_retries} retries due to rate limiting.")
 
     def upload_video(self, video_path):
         """Uploads video to Gemini File API."""
@@ -112,7 +136,7 @@ class VideoEditor:
         """
 
         print("🤖 Asking Gemini for FFmpeg filter...")
-        response = self.client.models.generate_content(
+        response = self._generate_with_retry(
             model=self.model_name,
             contents=[video_file_obj, prompt],
             config=types.GenerateContentConfig(
@@ -208,7 +232,7 @@ class VideoEditor:
         """
 
         print("🤖 Asking Gemini for Remotion effects config...")
-        response = self.client.models.generate_content(
+        response = self._generate_with_retry(
             model=self.model_name,
             contents=[video_file_obj, prompt],
             config=types.GenerateContentConfig(

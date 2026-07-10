@@ -37,7 +37,7 @@ DEFAULT_VOICES = {
 }
 
 
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")
 
 
 # ═══════════════════════════════════════════════════════════════════════

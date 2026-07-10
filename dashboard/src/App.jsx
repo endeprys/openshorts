@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
+import ModelSelector from './components/ModelSelector';
+import LanguageSelector from './components/LanguageSelector';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -179,6 +181,7 @@ function App() {
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
+  const [retryData, setRetryData] = useState(null);
   const [logs, setLogs] = useState([]);
   const [logsVisible, setLogsVisible] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
@@ -191,6 +194,15 @@ function App() {
   const [syncedTime, setSyncedTime] = useState(0);
   const [isSyncedPlaying, setIsSyncedPlaying] = useState(false);
   const [syncTrigger, setSyncTrigger] = useState(0);
+
+  const [model, setModel] = useState(() => {
+    const stored = localStorage.getItem('gemini_model');
+    return stored || '';
+  });
+
+  const [lang, setLang] = useState(() => {
+    return localStorage.getItem('output_lang') || 'English';
+  });
 
   const handleClipPlay = (startTime) => {
     setSyncedTime(startTime);
@@ -249,10 +261,17 @@ function App() {
   }, [jobId, status, results, activeTab]);
 
   useEffect(() => {
-    // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
-    // For now keeping gemini plain for compatibility unless requested.
     if (apiKey) localStorage.setItem('gemini_key', apiKey);
   }, [apiKey]);
+
+  useEffect(() => {
+    if (model) localStorage.setItem('gemini_model', model);
+    else localStorage.removeItem('gemini_model');
+  }, [model]);
+
+  useEffect(() => {
+    localStorage.setItem('output_lang', lang);
+  }, [lang]);
 
   useEffect(() => {
     if (uploadPostKey) {
@@ -283,7 +302,7 @@ function App() {
 
   useEffect(() => {
     let interval;
-    if ((status === 'processing' || status === 'completed') && jobId) {
+    if ((status === 'processing' || status === 'completed' || status === 'ai_retry_processing') && jobId) {
       interval = setInterval(async () => {
         try {
           const data = await pollJob(jobId);
@@ -302,6 +321,16 @@ function App() {
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setLogs(prev => [...prev, "Error: " + errorMsg]);
             clearInterval(interval);
+          } else if (data.status === 'ai_needs_retry') {
+            setStatus('ai_needs_retry');
+            if (data.retry_data) {
+              setRetryData(data.retry_data);
+            }
+            if (data.logs) setLogs(data.logs);
+            clearInterval(interval);
+          } else if (data.status === 'ai_retry_complete') {
+            setStatus('ai_retry_processing');
+            if (data.logs) setLogs(data.logs);
           } else {
             // Update logs if available
             if (data.logs) setLogs(data.logs);
@@ -350,21 +379,32 @@ function App() {
 
     try {
       let body;
+      const currentModel = model || '';
+      const currentLang = lang || 'English';
       const headers = { 'X-Gemini-Key': apiKey };
+
+      if (currentModel) {
+        headers['X-Gemini-Model'] = currentModel;
+      }
+      headers['X-Gemini-Lang'] = currentLang;
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload, acknowledged: !!data.acknowledged });
+        const payload = { url: data.payload, acknowledged: !!data.acknowledged, lang: currentLang };
+        if (currentModel) payload.model = currentModel;
+        body = JSON.stringify(payload);
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
+        formData.append('lang', currentLang);
+        if (currentModel) formData.append('model', currentModel);
         body = formData;
       }
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
+        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey, 'X-Gemini-Lang': currentLang, ...(currentModel ? { 'X-Gemini-Model': currentModel } : {}) },
         body
       });
 
@@ -384,7 +424,31 @@ function App() {
     setResults(null);
     setLogs([]);
     setProcessingMedia(null);
+    setRetryData(null);
     localStorage.removeItem(SESSION_KEY);
+  };
+
+  const handleRetryAI = async (retryModel) => {
+    if (!jobId || !retryModel) return;
+    setStatus('ai_retry_processing');
+    setLogs(l => [...l, `🔄 Retrying AI analysis with model: ${retryModel}...`]);
+    try {
+      const res = await fetch(getApiUrl('/api/retry-ai'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Gemini-Key': apiKey },
+        body: JSON.stringify({ job_id: jobId, model: retryModel, lang: lang || 'English' })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setLogs(l => [...l, `✅ AI analysis successful! Found ${data.clips_count} clips. Processing...`]);
+      } else {
+        setStatus('ai_needs_retry');
+        setLogs(l => [...l, `❌ ${data.error || 'AI analysis failed again'}`]);
+      }
+    } catch (e) {
+      setStatus('ai_needs_retry');
+      setLogs(l => [...l, `Error: ${e.message}`]);
+    }
   };
 
   // --- UI Components ---
@@ -1022,7 +1086,7 @@ function App() {
                   </p>
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} model={model} onModelChange={setModel} lang={lang} onLangChange={setLang} />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
@@ -1033,8 +1097,43 @@ function App() {
             </div>
           )}
 
+          {/* View: AI Retry Needed */}
+          {activeTab === 'dashboard' && status === 'ai_needs_retry' && (
+            <div className="h-full flex flex-col items-center justify-center p-6 animate-[fadeIn_0.3s_ease-out]">
+              <div className="max-w-lg w-full bg-surface border border-yellow-500/30 rounded-2xl p-8 text-center space-y-6">
+                <div className="w-16 h-16 mx-auto rounded-full bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
+                  <AlertTriangle className="text-yellow-400" size={28} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-white mb-2">AI Analysis Failed</h2>
+                  <p className="text-zinc-400 text-sm">
+                    The model <code className="text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded text-xs">{retryData?.last_model || 'selected'}</code> could not analyze this video.
+                    Choose a different model and try again.
+                  </p>
+                </div>
+                <div className="space-y-3">
+                  <label className="text-xs text-zinc-500 block text-left">Select model for retry</label>
+                  <ModelSelector model={model} onModelChange={setModel} />
+                  <label className="text-xs text-zinc-500 block text-left mt-3">Output Language</label>
+                  <LanguageSelector lang={lang} onLangChange={setLang} />
+                  <button
+                    onClick={() => handleRetryAI(model)}
+                    disabled={!model}
+                    className="w-full btn-primary flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    <RotateCcw size={16} />
+                    Retry AI Analysis
+                  </button>
+                </div>
+                <button onClick={handleReset} className="text-xs text-zinc-500 hover:text-white transition-colors">
+                  Cancel & Start Over
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* View: Processing / Results (Split View) */}
-          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error') && (
+          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error' || status === 'ai_retry_processing') && (
             <div className="h-full flex flex-col md:flex-row animate-[fadeIn_0.3s_ease-out]">
 
               {/* Left Panel: Preview & Status */}
