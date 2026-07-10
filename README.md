@@ -22,6 +22,7 @@
 | **Мультиязычный вывод** | Параметр `--lang` / переменная `OUTPUT_LANGUAGE`. Заголовки, описания и hook-тексты генерируются на указанном языке (15 языков, включая русский, казахский, украинский). |
 | **Выбор модели Gemini** | Все модули читают модель из `GEMINI_MODEL_NAME` (env-var). UI-селектор моделей Gemini 3/2.5/2.0 Flash/Pro. |
 | **Retry при ошибках API** | Автоматические повторные попытки при 429 (rate limit) и 503 Gemini с exponential backoff. Интерфейс повторного запуска AI после неудачи. |
+| **Прямая выгрузка на YouTube** | Выкладка видео напрямую через YouTube Data API v3 (OAuth 2.0, resumable upload). Без сторонних платных сервисов вроде Upload-Post. Никаких ограничений по количеству видео. |
 | **Публикация blob-видео** | Возможность постить в соцсети видео, отрендеренные в браузере (с сохранением на сервер). |
 
 **Free & open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**. Self-hosted with Docker. No watermarks, no limits.
