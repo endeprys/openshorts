@@ -29,46 +29,38 @@ load_dotenv()
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
 
-GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+CHUNK_PROMPT_TEMPLATE = """
+You are analyzing TIME SEGMENT {chunk_start}s–{chunk_end}s of a {video_duration}s video.
+Pick {per_chunk_clips} viral moment(s) from WITHIN THIS SEGMENT ONLY.
+Each clip 15–60s, must start >= {chunk_start} and end <= {chunk_end}.
 
-⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
-- Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
-- Only NUMBERS with decimal point, up to 3 decimals (examples: 0, 1.250, 17.350).
-- Ensure 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
-- Each clip between 15 and 60 s (inclusive).
-- Prefer starting 0.2–0.4 s BEFORE the hook and ending 0.2–0.4 s AFTER the payoff.
-- Use silence moments for natural cuts; never cut in the middle of a word or phrase.
-- STRICTLY FORBIDDEN to use time formats other than absolute seconds.
+⚠️ RULES:
+- Return ABSOLUTE SECONDS, 0–3 decimals (e.g. 12.340).
+- 0 ≤ start < end ≤ {video_duration}.
+- Prefer starting 0.2–0.4s BEFORE the hook, ending 0.2–0.4s AFTER.
+- Cut at silence; never mid-word.
 
-VIDEO_DURATION_SECONDS: {video_duration}
-
-TRANSCRIPT_TEXT (raw):
-{transcript_text}
-
-WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
+WORDS IN THIS SEGMENT:
 {words_json}
 
-STRICT EXCLUSIONS:
-- No generic intros/outros or purely sponsorship segments unless they contain the hook.
-- No clips < 15 s or > 60 s.
+TRANSCRIPT IN THIS SEGMENT:
+{transcript_text}
 
-LANGUAGE REQUIREMENT:
-- Write ALL titles, descriptions, hook texts and any output text IN THIS LANGUAGE: {output_language}
-- The viral_hook_text must be punchy and engaging in {output_language}
-- The descriptions must include a CTA appropriate for {output_language} culture
-- Examples of CTAs in {output_language}: if English use "Follow me and comment X", if Russian use "Подпишись и напиши X", etc.
+LANGUAGE: {output_language}
+- All output in {output_language}
+- viral_hook_text: punchy, max 10 words
+- Include culturally-appropriate CTA
 
-OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst):
+OUTPUT — ONLY VALID JSON, no markdown. EXACTLY {per_chunk_clips} entries:
 {{
   "shorts": [
     {{
-      "start": <number in seconds, e.g., 12.340>,
-      "end": <number in seconds, e.g., 37.900>,
-      "video_description_for_tiktok": "<description for TikTok in {output_language}>",
-      "video_description_for_instagram": "<description for Instagram in {output_language}>",
-      "video_title_for_youtube_short": "<title for YouTube Short in {output_language} 100 chars max>",
-      "viral_hook_text": "<SHORT punchy text overlay (max 10 words) in {output_language}>"
+      "start": <number>,
+      "end": <number>,
+      "video_description_for_tiktok": "<in {output_language}>",
+      "video_description_for_instagram": "<in {output_language}>",
+      "video_title_for_youtube_short": "<in {output_language}, max 100 chars>",
+      "viral_hook_text": "<max 10 words in {output_language}>"
     }}
   ]
 }}
@@ -813,123 +805,14 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def call_ollama(model_name, prompt, video_duration):
-    """Call Ollama API for viral clip analysis."""
-    ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model = model_name.replace("ollama:", "", 1)
-    
-    print(f"🦙 Calling Ollama with model: {ollama_model}")
-    
-    system_prompt = "You are a senior short-form video editor. You MUST respond with VALID JSON only, no markdown, no explanations."
-    
-    payload = {
-        "model": ollama_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "stream": False,
-        "options": {
-            "temperature": 0.1
-        },
-        "format": "json"
-    }
-    
-    max_retries = 3
-    base_delay = 5
-    
-    for attempt in range(max_retries):
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.post(f"{ollama_base}/api/chat", json=payload)
-                
-            if resp.status_code != 200:
-                print(f"❌ Ollama Error ({resp.status_code}): {resp.text}")
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    print(f"⏳ Retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(delay)
-                    continue
-                return None
-            
-            data = resp.json()
-            content = data.get("message", {}).get("content", "")
-            
-            if not content:
-                print("❌ Ollama returned empty response")
-                return None
-            
-            text = content.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            elif text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            
-            result = json.loads(text)
-            result['cost_analysis'] = {
-                "model": f"ollama:{ollama_model}",
-                "provider": "ollama",
-                "total_cost": 0
-            }
-            print(f"🔥 Ollama identified {len(result.get('shorts', []))} viral clips!")
-            return result
-            
-        except httpx.TimeoutException:
-            print(f"⏳ Ollama timeout. Retrying... (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-        except json.JSONDecodeError as e:
-            print(f"❌ Ollama JSON parse error: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ Ollama error: {e}")
-            return None
-    
-    return None
-
-
-def get_viral_clips(transcript_result, video_duration, model_name=None):
-    if not model_name:
-        model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
-
-    # Extract words
-    words = []
-    for segment in transcript_result['segments']:
-        for word in segment.get('words', []):
-            words.append({
-                'w': word['word'],
-                's': word['start'],
-                'e': word['end']
-            })
-
-    output_language = os.getenv("OUTPUT_LANGUAGE", "English")
-    prompt = GEMINI_PROMPT_TEMPLATE.format(
-        video_duration=video_duration,
-        transcript_text=json.dumps(transcript_result['text']),
-        words_json=json.dumps(words),
-        output_language=output_language
-    )
-
-    # Route to Ollama if model starts with ollama:
-    if model_name.startswith("ollama:"):
-        return call_ollama(model_name, prompt, video_duration)
-
-    # Gemini path
-    print("🤖  Analyzing with Gemini...")
-    
+def _call_gemini(prompt, model_name, max_retries=5):
+    """Make a single Gemini API call with retry logic."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("❌ Error: GEMINI_API_KEY not found in environment variables.")
-        return None
+        return None, None
 
     client = genai.Client(api_key=api_key)
-    
-    print(f"🤖  Initializing Gemini with model: {model_name}")
-
-    max_retries = 5
     base_delay = 5
 
     for attempt in range(max_retries):
@@ -938,53 +821,34 @@ def get_viral_clips(transcript_result, video_duration, model_name=None):
                 model=model_name,
                 contents=prompt
             )
-            
-            # --- Cost Calculation ---
+
+            cost_analysis = None
             try:
                 usage = response.usage_metadata
                 if usage:
-                    input_price_per_million = 0.10
-                    output_price_per_million = 0.40
-                    
-                    prompt_tokens = usage.prompt_token_count
-                    output_tokens = usage.candidates_token_count
-                    
-                    input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-                    output_cost = (output_tokens / 1_000_000) * output_price_per_million
-                    total_cost = input_cost + output_cost
-                    
+                    input_price = 0.10
+                    output_price = 0.40
+                    pt = usage.prompt_token_count
+                    ot = usage.candidates_token_count
                     cost_analysis = {
-                        "input_tokens": prompt_tokens,
-                        "output_tokens": output_tokens,
-                        "input_cost": input_cost,
-                        "output_cost": output_cost,
-                        "total_cost": total_cost,
+                        "input_tokens": pt, "output_tokens": ot,
+                        "input_cost": (pt / 1_000_000) * input_price,
+                        "output_cost": (ot / 1_000_000) * output_price,
+                        "total_cost": ((pt / 1_000_000) * input_price) + ((ot / 1_000_000) * output_price),
                         "model": model_name
                     }
+                    print(f"💰 Tokens: {pt} in / {ot} out  Cost: ${cost_analysis['total_cost']:.6f}")
+            except Exception:
+                pass
 
-                    print(f"💰 Token Usage ({model_name}):")
-                    print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
-                    print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
-                    print(f"   - Total Estimated Cost: ${total_cost:.6f}")
-                    
-            except Exception as e:
-                print(f"⚠️ Could not calculate cost: {e}")
-                cost_analysis = None
-            # ------------------------
-
-            # Clean response if it contains markdown code blocks
             text = response.text
             if text.startswith("```json"):
                 text = text[7:]
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            
-            result_json = json.loads(text)
-            if cost_analysis:
-                result_json['cost_analysis'] = cost_analysis
-                
-            return result_json
+
+            return json.loads(text), cost_analysis
 
         except Exception as e:
             error_str = str(e)
@@ -994,14 +858,164 @@ def get_viral_clips(transcript_result, video_duration, model_name=None):
                 delay_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
                 delay = float(delay_match.group(1)) if delay_match else base_delay * (2 ** attempt)
                 code = "429" if "429" in error_str else "503"
-                print(f"⏳ Gemini {code}. Retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                print(f"⏳ {code}. Retry in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
                 print(f"❌ Gemini Error: {e}")
-                return None
-    
+                return None, None
+
     print(f"❌ Gemini failed after {max_retries} retries.")
-    return None
+    return None, None
+
+
+def _call_ollama(prompt, model_name, video_duration):
+    """Call Ollama API for clip analysis."""
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model = model_name.replace("ollama:", "", 1)
+    url = f"{base_url}/api/chat"
+
+    payload = {
+        "model": ollama_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"num_ctx": 32768}
+    }
+
+    try:
+        resp = httpx.post(url, json=payload, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("message", {}).get("content", "")
+
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        return json.loads(text), None
+    except Exception as e:
+        print(f"❌ Ollama Error: {e}")
+        return None, None
+
+
+def get_viral_clips(transcript_result, video_duration, model_name=None, max_clips=30):
+    """
+    Chunked AI analysis: split transcript by time, analyze each chunk separately,
+    then merge results. This ensures full-video coverage and avoids 'lost in the middle'.
+    """
+    if not model_name:
+        model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
+    # Extract all words with timestamps
+    all_words = []
+    for segment in transcript_result['segments']:
+        for word in segment.get('words', []):
+            all_words.append({
+                'w': word['word'],
+                's': word['start'],
+                'e': word['end']
+            })
+
+    output_language = os.getenv("OUTPUT_LANGUAGE", "English")
+
+    # Determine number of chunks: 1 chunk per ~3 clips, min 1, max ~15
+    num_chunks = max(1, min(int(max_clips / 2), 15))
+    chunk_duration = video_duration / num_chunks
+    per_chunk_clips = max(1, (max_clips + num_chunks - 1) // num_chunks)  # ceil division
+    total_target = per_chunk_clips * num_chunks  # may be slightly over max_clips
+
+    print(f"🧠 Smart chunk analysis: {num_chunks} chunks × {per_chunk_clips} clips each "
+          f"(~{chunk_duration:.0f}s per chunk), targeting ~{total_target} clips total")
+
+    is_ollama = model_name.startswith("ollama:")
+    caller = _call_ollama if is_ollama else _call_gemini
+
+    all_shorts = []
+    total_cost = None
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for chunk_idx in range(num_chunks):
+        chunk_start = chunk_idx * chunk_duration
+        chunk_end = min((chunk_idx + 1) * chunk_duration, video_duration)
+
+        # Filter words in this chunk
+        chunk_words = [w for w in all_words if w['s'] < chunk_end and w['e'] > chunk_start]
+
+        if not chunk_words:
+            print(f"  ⏭️  Chunk {chunk_idx + 1}: no words in {chunk_start:.0f}s–{chunk_end:.0f}s, skipping")
+            continue
+
+        # Build text from words
+        chunk_text = ' '.join(w['w'] for w in chunk_words)
+
+        prompt = CHUNK_PROMPT_TEMPLATE.format(
+            video_duration=video_duration,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            per_chunk_clips=per_chunk_clips,
+            transcript_text=chunk_text[:10000],  # cap per-chunk transcript
+            words_json=json.dumps(chunk_words[:2000]),  # cap per-chunk words
+            output_language=output_language
+        )
+
+        print(f"  🔍 Chunk {chunk_idx + 1}/{num_chunks}: {chunk_start:.0f}s–{chunk_end:.0f}s "
+              f"({len(chunk_words)} words, {len(chunk_text)} chars)...")
+
+        result, cost = caller(prompt, model_name, video_duration)
+
+        if result and 'shorts' in result and len(result['shorts']) > 0:
+            for s in result['shorts']:
+                s['_chunk'] = chunk_idx
+                s['_chunk_start'] = chunk_start
+                s['_chunk_end'] = chunk_end
+            all_shorts.extend(result['shorts'])
+            print(f"    ✅ Got {len(result['shorts'])} clips from this chunk")
+
+            if cost:
+                total_input_tokens += cost.get('input_tokens', 0)
+                total_output_tokens += cost.get('output_tokens', 0)
+                if total_cost is None:
+                    total_cost = cost
+                else:
+                    total_cost['input_tokens'] += cost.get('input_tokens', 0)
+                    total_cost['output_tokens'] += cost.get('output_tokens', 0)
+                    total_cost['input_cost'] += cost.get('input_cost', 0)
+                    total_cost['output_cost'] += cost.get('output_cost', 0)
+                    total_cost['total_cost'] += cost.get('total_cost', 0)
+        else:
+            print(f"    ⚠️  No clips from this chunk")
+
+    if not all_shorts:
+        print("❌ No clips found in any chunk.")
+        return None
+
+    # Deduplicate: remove clips whose start times are within 5s of each other
+    all_shorts.sort(key=lambda x: x['start'])
+    deduped = []
+    for s in all_shorts:
+        if not deduped or s['start'] - deduped[-1]['start'] > 5:
+            deduped.append(s)
+
+    print(f"🔥 Total: {len(deduped)} unique clips from {num_chunks} chunks "
+          f"(removed {len(all_shorts) - len(deduped)} near-duplicates)")
+
+    # Final sort by _chunk for consistent ordering
+    deduped.sort(key=lambda x: x.get('_chunk', 0))
+
+    # Truncate to max_clips
+    if len(deduped) > max_clips:
+        deduped = deduped[:max_clips]
+        print(f"   Truncated to {max_clips} clips")
+
+    result_data = {"shorts": deduped}
+
+    if total_cost:
+        result_data['cost_analysis'] = total_cost
+        total_cost['model'] = model_name
+
+    return result_data
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
@@ -1016,6 +1030,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, help="Gemini or Ollama model name (prefix ollama: for Ollama). Can also be set via GEMINI_MODEL_NAME env var.")
     parser.add_argument('--no-fallback', action='store_true', help="If AI analysis fails, save transcript for retry instead of processing whole video.")
     parser.add_argument('--lang', type=str, default="English", help="Output language for titles, descriptions and hooks (default: English). Examples: Russian, Spanish, French, etc.")
+    parser.add_argument('--max-clips', type=int, default=30, help="Maximum number of clips to extract (default: 30). Increase for longer videos to get more shorts.")
     
     args = parser.parse_args()
 
@@ -1083,7 +1098,13 @@ if __name__ == '__main__':
         model_name = args.model or os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
         output_language = args.lang or os.getenv("OUTPUT_LANGUAGE", "English")
         os.environ["OUTPUT_LANGUAGE"] = output_language
-        clips_data = get_viral_clips(transcript, duration, model_name=model_name)
+        max_clips = args.max_clips or int(os.getenv("MAX_CLIPS", "30"))
+        # Cap max_clips so each clip has at least 15s of video to work with
+        max_possible = int(duration // 15)
+        if max_clips > max_possible:
+            print(f"⚠️ Video is only {duration:.0f}s long — capping max_clips from {max_clips} to {max_possible}")
+            max_clips = max_possible
+        clips_data = get_viral_clips(transcript, duration, model_name=model_name, max_clips=max_clips)
         
         if not clips_data or 'shorts' not in clips_data:
             if args.no_fallback:

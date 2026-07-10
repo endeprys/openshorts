@@ -204,6 +204,11 @@ function App() {
     return localStorage.getItem('output_lang') || 'English';
   });
 
+  const [maxClips, setMaxClips] = useState(() => {
+    const stored = localStorage.getItem('max_clips');
+    return stored ? parseInt(stored) : 30;
+  });
+
   const [selectedClips, setSelectedClips] = useState(new Set());
   const [showBatchSubtitle, setShowBatchSubtitle] = useState(false);
   const [showBatchYoutube, setShowBatchYoutube] = useState(false);
@@ -363,6 +368,10 @@ function App() {
   }, [lang]);
 
   useEffect(() => {
+    localStorage.setItem('max_clips', String(maxClips));
+  }, [maxClips]);
+
+  useEffect(() => {
     if (uploadPostKey) {
       localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
     }
@@ -470,16 +479,18 @@ function App() {
       let body;
       const currentModel = model || '';
       const currentLang = lang || 'English';
+      const currentMaxClips = maxClips || 30;
       const headers = { 'X-Gemini-Key': apiKey };
 
       if (currentModel) {
         headers['X-Gemini-Model'] = currentModel;
       }
       headers['X-Gemini-Lang'] = currentLang;
+      headers['X-Gemini-Max-Clips'] = String(currentMaxClips);
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        const payload = { url: data.payload, acknowledged: !!data.acknowledged, lang: currentLang };
+        const payload = { url: data.payload, acknowledged: !!data.acknowledged, lang: currentLang, max_clips: currentMaxClips };
         if (currentModel) payload.model = currentModel;
         body = JSON.stringify(payload);
       } else {
@@ -487,13 +498,14 @@ function App() {
         formData.append('file', data.payload);
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         formData.append('lang', currentLang);
+        formData.append('max_clips', String(currentMaxClips));
         if (currentModel) formData.append('model', currentModel);
         body = formData;
       }
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey, 'X-Gemini-Lang': currentLang, ...(currentModel ? { 'X-Gemini-Model': currentModel } : {}) },
+        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey, 'X-Gemini-Lang': currentLang, 'X-Gemini-Max-Clips': String(currentMaxClips), ...(currentModel ? { 'X-Gemini-Model': currentModel } : {}) },
         body
       });
 
@@ -1175,7 +1187,7 @@ function App() {
                   </p>
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} model={model} onModelChange={setModel} lang={lang} onLangChange={setLang} />
+                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} model={model} onModelChange={setModel} lang={lang} onLangChange={setLang} maxClips={maxClips} onMaxClipsChange={setMaxClips} />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

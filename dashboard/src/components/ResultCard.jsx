@@ -317,10 +317,15 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
     const handlePost = async () => {
         const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
+
         if (selectedPlatforms.length === 0) {
             setPostResult({ success: false, msg: "Select at least one platform." });
             return;
         }
+
+        const wantsYoutube = selectedPlatforms.includes('youtube');
+        const otherPlatforms = selectedPlatforms.filter(p => p !== 'youtube');
+        const wantsOther = otherPlatforms.length > 0;
 
         // If current video is a browser-rendered blob, persist it to server first
         if (currentVideoUrl.startsWith('blob:')) {
@@ -348,24 +353,25 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             }
         }
 
-        // YouTube direct upload (no Upload-Post needed)
-        const wantsYoutube = selectedPlatforms.includes('youtube');
-        const wantsOther = selectedPlatforms.some(p => p !== 'youtube');
+        if (isScheduling && !scheduleDate) {
+            setPostResult({ success: false, msg: "Please select a date and time." });
+            return;
+        }
 
-        if (wantsYoutube && !wantsOther) {
-            // YouTube only — use direct upload
+        setPosting(true);
+        setPostResult(null);
+
+        let youtubeResult = null;
+        let uploadPostResult = null;
+        let hasError = false;
+
+        // Step 1: Upload to YouTube via Direct Upload (if selected and configured)
+        if (wantsYoutube) {
             if (!youtubeRefreshToken) {
                 setPostResult({ success: false, msg: "YouTube not connected. Go to Settings → YouTube Direct Upload." });
+                setPosting(false);
                 return;
             }
-
-            if (isScheduling && !scheduleDate) {
-                setPostResult({ success: false, msg: "Please select a date and time." });
-                return;
-            }
-
-            setPosting(true);
-            setPostResult(null);
 
             try {
                 const res = await fetch(getApiUrl('/api/youtube/upload'), {
@@ -386,70 +392,91 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
                 if (!res.ok) {
                     const errText = await res.text();
-                    try { const j = JSON.parse(errText); throw new Error(j.detail || errText); }
-                    catch (e) { throw new Error(errText); }
+                    let errMsg;
+                    try { const j = JSON.parse(errText); errMsg = j.detail || errText; }
+                    catch (e) { errMsg = errText; }
+                    youtubeResult = { success: false, error: errMsg };
+                    hasError = true;
+                } else {
+                    const data = await res.json();
+                    youtubeResult = { success: true, video_url: data.video_url };
                 }
-
-                const data = await res.json();
-                setPostResult({ success: true, msg: `Posted to YouTube Shorts! ${data.video_url}` });
-                setTimeout(() => { setShowModal(false); setPostResult(null); }, 4000);
             } catch (e) {
-                setPostResult({ success: false, msg: `YouTube upload failed: ${e.message}` });
-            } finally {
-                setPosting(false);
+                youtubeResult = { success: false, error: e.message };
+                hasError = true;
             }
-            return;
         }
 
-        // Mixed platforms or non-YouTube — use Upload-Post
-        if (!uploadPostKey || !uploadUserId) {
-            setPostResult({ success: false, msg: "Missing Upload-Post API Key or User ID for TikTok/Instagram." });
-            return;
-        }
+        // Step 2: Upload remaining platforms via Upload-Post (if any non-YouTube platforms selected)
+        if (wantsOther) {
+            if (!uploadPostKey || !uploadUserId) {
+                uploadPostResult = { success: false, error: "Missing Upload-Post API Key or User ID for TikTok/Instagram." };
+                hasError = true;
+            } else {
+                try {
+                    const payload = {
+                        job_id: jobId,
+                        clip_index: index,
+                        api_key: uploadPostKey,
+                        user_id: uploadUserId,
+                        platforms: otherPlatforms,
+                        title: postTitle,
+                        description: postDescription
+                    };
 
-        if (isScheduling && !scheduleDate) {
-            setPostResult({ success: false, msg: "Please select a date and time." });
-            return;
-        }
+                    if (isScheduling && scheduleDate) {
+                        payload.scheduled_date = new Date(scheduleDate).toISOString();
+                        payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    }
 
-        setPosting(true);
-        setPostResult(null);
+                    const res = await fetch(getApiUrl('/api/social/post'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
 
-        try {
-            const payload = {
-                job_id: jobId,
-                clip_index: index,
-                api_key: uploadPostKey,
-                user_id: uploadUserId,
-                platforms: selectedPlatforms,
-                title: postTitle,
-                description: postDescription
-            };
-
-            if (isScheduling && scheduleDate) {
-                payload.scheduled_date = new Date(scheduleDate).toISOString();
-                payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    if (!res.ok) {
+                        const errText = await res.text();
+                        let errMsg;
+                        try { const j = JSON.parse(errText); errMsg = j.detail || errText; }
+                        catch (e) { errMsg = errText; }
+                        uploadPostResult = { success: false, error: errMsg };
+                        hasError = true;
+                    } else {
+                        uploadPostResult = { success: true };
+                    }
+                } catch (e) {
+                    uploadPostResult = { success: false, error: e.message };
+                    hasError = true;
+                }
             }
-
-            const res = await fetch(getApiUrl('/api/social/post'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
-            if (!res.ok) {
-                const errText = await res.text();
-                try { const j = JSON.parse(errText); throw new Error(j.detail || errText); }
-                catch (e) { throw new Error(errText); }
-            }
-
-            setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
-            setTimeout(() => { setShowModal(false); setPostResult(null); }, 3000);
-        } catch (e) {
-            setPostResult({ success: false, msg: `Failed: ${e.message}` });
-        } finally {
-            setPosting(false);
         }
+
+        // Build result message
+        if (hasError) {
+            const parts = [];
+            if (youtubeResult && !youtubeResult.success) {
+                parts.push(`YouTube: ${youtubeResult.error}`);
+            }
+            if (uploadPostResult && !uploadPostResult.success) {
+                const platforms = otherPlatforms.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('/');
+                parts.push(`${platforms}: ${uploadPostResult.error}`);
+            }
+            setPostResult({ success: false, msg: parts.join(' | ') });
+        } else {
+            const parts = [];
+            if (youtubeResult?.success) {
+                parts.push(`Posted to YouTube Shorts! ${youtubeResult.video_url}`);
+            }
+            if (uploadPostResult?.success) {
+                const platforms = otherPlatforms.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('/');
+                parts.push(`Posted to ${platforms}!`);
+            }
+            setPostResult({ success: true, msg: parts.join(' ') });
+            setTimeout(() => { setShowModal(false); setPostResult(null); }, 4000);
+        }
+
+        setPosting(false);
     };
 
     return (

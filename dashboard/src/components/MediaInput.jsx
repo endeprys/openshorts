@@ -4,7 +4,7 @@ import { getApiUrl } from '../config';
 import ModelSelector from './ModelSelector';
 import LanguageSelector from './LanguageSelector';
 
-export default function MediaInput({ onProcess, isProcessing, model, onModelChange, lang, onLangChange }) {
+export default function MediaInput({ onProcess, isProcessing, model, onModelChange, lang, onLangChange, maxClips, onMaxClipsChange }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [mode, setMode] = useState('url'); // 'url' | 'file'
     const [url, setUrl] = useState('');
@@ -123,6 +123,25 @@ export default function MediaInput({ onProcess, isProcessing, model, onModelChan
                     <div className="flex-1">
                         <label className="text-xs text-zinc-500 mb-1.5 block">Output Language</label>
                         <LanguageSelector lang={lang} onLangChange={onLangChange} />
+                    </div>
+                </div>
+
+                <div className="mt-4">
+                    <label className="text-xs text-zinc-500 mb-1.5 block flex items-center justify-between">
+                        <span>Max Clips to Extract</span>
+                        <span className="text-primary font-bold">{maxClips}</span>
+                    </label>
+                    <input
+                        type="range"
+                        min="5"
+                        max="100"
+                        value={maxClips}
+                        onChange={(e) => onMaxClipsChange(parseInt(e.target.value))}
+                        className="w-full accent-primary"
+                    />
+                    <div className="flex justify-between text-[10px] text-zinc-600">
+                        <span>5</span>
+                        <span>100</span>
                     </div>
                 </div>
 

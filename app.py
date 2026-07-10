@@ -352,7 +352,8 @@ async def process_endpoint(
     url: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    lang: Optional[str] = Form(None)
+    lang: Optional[str] = Form(None),
+    max_clips: Optional[int] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
@@ -368,9 +369,12 @@ async def process_endpoint(
         ack_flag = bool(body.get("acknowledged"))
         model = body.get("model") or model
         lang = body.get("lang") or lang
+        max_clips = body.get("max_clips") or max_clips
     else:
         model = model or request.headers.get("X-Gemini-Model")
         lang = lang or request.headers.get("X-Gemini-Lang")
+        mc_header = request.headers.get("X-Gemini-Max-Clips")
+        max_clips = max_clips if max_clips is not None else (int(mc_header) if mc_header else None)
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -411,6 +415,9 @@ async def process_endpoint(
     if lang:
         env["OUTPUT_LANGUAGE"] = lang
         cmd.extend(["--lang", lang])
+    if max_clips is not None:
+        env["MAX_CLIPS"] = str(max_clips)
+        cmd.extend(["--max-clips", str(max_clips)])
 
     if url:
         cmd.extend(["-u", url])
@@ -1248,7 +1255,7 @@ async def batch_youtube_upload(
 
             final_title = (f"{req.title} #{clip_index+1}" if req.title
                           else clip.get('video_title_for_youtube_short', f'Viral Short #{clip_index+1}'))
-            final_description = req.description or clip.get('video_description_for_youtube', '')
+            final_description = req.description or ''
 
             result = yt_upload_video(
                 file_path=file_path,
@@ -1702,7 +1709,7 @@ async def youtube_upload(
         access_token = token_data["access_token"]
 
         final_title = req.title or clip.get('video_title_for_youtube_short', 'Viral Short')
-        final_description = req.description or clip.get('video_description_for_youtube', '')
+        final_description = req.description or ''
 
         print(f"📤 Uploading to YouTube: {final_title}")
         result = yt_upload_video(

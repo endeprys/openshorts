@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import httpx
 import urllib.parse
 
@@ -8,6 +7,25 @@ YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
+MAX_TITLE_LENGTH = 100
+
+
+def _extract_youtube_error(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+        error = body.get("error", {})
+        message = error.get("message", "")
+        reason = ""
+        errors = error.get("errors", [])
+        if errors:
+            reason = errors[0].get("reason", "")
+        if message and reason:
+            return f"YouTube API {resp.status_code}: {message} (reason: {reason})"
+        if message:
+            return f"YouTube API {resp.status_code}: {message}"
+        return f"YouTube API {resp.status_code}: {resp.text[:500]}"
+    except Exception:
+        return f"YouTube API {resp.status_code}: {resp.text[:500]}"
 
 
 def get_oauth_url(client_id: str, redirect_uri: str) -> str:
@@ -57,6 +75,9 @@ def upload_video(
     privacy_status: str = "public",
     tags: list = None,
 ) -> dict:
+    title = title.strip()[:MAX_TITLE_LENGTH]
+    if not title:
+        raise ValueError("Video title cannot be empty after truncation")
     file_size = os.path.getsize(file_path)
 
     metadata = {
@@ -73,7 +94,7 @@ def upload_video(
 
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json; charset=UTF-8",
+        "Content-Type": "application/json",
         "X-Upload-Content-Length": str(file_size),
         "X-Upload-Content-Type": "video/mp4",
     }
@@ -86,7 +107,8 @@ def upload_video(
             headers=headers,
             content=json.dumps(metadata).encode("utf-8"),
         )
-        init_resp.raise_for_status()
+        if not init_resp.is_success:
+            raise Exception(_extract_youtube_error(init_resp))
 
         upload_url = init_resp.headers.get("Location")
         if not upload_url:
@@ -104,7 +126,8 @@ def upload_video(
         }
 
         upload_resp = client.put(upload_url, headers=upload_headers, content=video_data)
-        upload_resp.raise_for_status()
+        if not upload_resp.is_success:
+            raise Exception(_extract_youtube_error(upload_resp))
 
         result = upload_resp.json()
         video_id = result.get("id", "")
