@@ -1111,6 +1111,165 @@ async def add_subtitles(req: SubtitleRequest):
         "new_video_url": f"/videos/{req.job_id}/{output_filename}"
     }
 
+class BatchSubtitleRequest(BaseModel):
+    job_id: str
+    clip_indices: List[int]
+    position: str = "bottom"
+    font_size: int = 16
+    font_name: str = "Verdana"
+    font_color: str = "#FFFFFF"
+    border_color: str = "#000000"
+    border_width: int = 2
+    bg_color: str = "#000000"
+    bg_opacity: float = 0.0
+
+@app.post("/api/batch/subtitle")
+async def batch_add_subtitles(req: BatchSubtitleRequest, background_tasks: BackgroundTasks):
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+
+    transcript = data.get('transcript')
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Transcript not found in metadata")
+
+    clips = data.get('shorts', [])
+
+    results = []
+    for clip_index in req.clip_indices:
+        if clip_index >= len(clips):
+            results.append({"clip_index": clip_index, "success": False, "error": "Clip not found"})
+            continue
+
+        clip_data = clips[clip_index]
+        filename = clip_data.get('video_url', '').split('/')[-1]
+        if not filename:
+            base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+            filename = f"{base_name}_clip_{clip_index+1}.mp4"
+
+        input_path = os.path.join(output_dir, filename)
+        if not os.path.exists(input_path):
+            results.append({"clip_index": clip_index, "success": False, "error": f"Video file not found: {filename}"})
+            continue
+
+        srt_filename = f"subs_{clip_index}_{int(time.time())}.srt"
+        srt_path = os.path.join(output_dir, srt_filename)
+        output_filename = f"subtitled_{filename}"
+        output_path = os.path.join(output_dir, output_filename)
+
+        try:
+            success_srt = generate_srt(transcript, clip_data['start'], clip_data['end'], srt_path)
+            if not success_srt:
+                results.append({"clip_index": clip_index, "success": False, "error": "No words found for this clip range"})
+                continue
+
+            def run_burn():
+                burn_subtitles(input_path, srt_path, output_path,
+                              alignment=req.position, fontsize=req.font_size,
+                              font_name=req.font_name, font_color=req.font_color,
+                              border_color=req.border_color, border_width=req.border_width,
+                              bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, run_burn)
+
+            # Update in-memory job
+            if clip_index < len(job.get('result', {}).get('clips', [])):
+                jobs[req.job_id]['result']['clips'][clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+
+            # Update metadata on disk
+            if clip_index < len(clips):
+                clips[clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+                data['shorts'] = clips
+                with open(json_files[0], 'w') as f:
+                    json.dump(data, f, indent=4)
+
+            results.append({
+                "clip_index": clip_index,
+                "success": True,
+                "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+            })
+        except Exception as e:
+            results.append({"clip_index": clip_index, "success": False, "error": str(e)})
+
+    return {"results": results}
+
+class BatchYoutubeUploadRequest(BaseModel):
+    job_id: str
+    clip_indices: List[int]
+    title: Optional[str] = None
+    description: Optional[str] = None
+    privacy_status: str = "public"
+
+@app.post("/api/batch/youtube-upload")
+async def batch_youtube_upload(
+    req: BatchYoutubeUploadRequest,
+    x_youtube_refresh_token: Optional[str] = Header(None, alias="X-Youtube-Refresh-Token"),
+    x_youtube_client_id: Optional[str] = Header(None, alias="X-Youtube-Client-Id"),
+    x_youtube_client_secret: Optional[str] = Header(None, alias="X-Youtube-Client-Secret"),
+):
+    if not x_youtube_refresh_token:
+        raise HTTPException(status_code=400, detail="Missing X-Youtube-Refresh-Token header")
+    if not x_youtube_client_id or not x_youtube_client_secret:
+        raise HTTPException(status_code=400, detail="Missing YouTube OAuth credentials")
+
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[req.job_id]
+    if 'result' not in job or 'clips' not in job['result']:
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    # Get fresh access token once
+    token_data = refresh_access_token(x_youtube_client_id, x_youtube_client_secret, x_youtube_refresh_token)
+    access_token = token_data["access_token"]
+
+    results = []
+    for clip_index in req.clip_indices:
+        try:
+            if clip_index >= len(job['result']['clips']):
+                results.append({"clip_index": clip_index, "success": False, "error": "Clip not found"})
+                continue
+
+            clip = job['result']['clips'][clip_index]
+            filename = clip['video_url'].split('/')[-1]
+            file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+
+            if not os.path.exists(file_path):
+                results.append({"clip_index": clip_index, "success": False, "error": f"Video file not found: {filename}"})
+                continue
+
+            final_title = (f"{req.title} #{clip_index+1}" if req.title
+                          else clip.get('video_title_for_youtube_short', f'Viral Short #{clip_index+1}'))
+            final_description = req.description or clip.get('video_description_for_youtube', '')
+
+            result = yt_upload_video(
+                file_path=file_path,
+                access_token=access_token,
+                title=final_title,
+                description=final_description,
+                privacy_status=req.privacy_status,
+            )
+
+            video_id = result.get("id", "")
+            results.append({
+                "clip_index": clip_index,
+                "success": True,
+                "video_id": video_id,
+                "video_url": f"https://youtu.be/{video_id}"
+            })
+        except Exception as e:
+            results.append({"clip_index": clip_index, "success": False, "error": str(e)})
+
+    return {"results": results}
+
 class HookRequest(BaseModel):
     job_id: str
     clip_index: int

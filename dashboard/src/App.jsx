@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Type, Loader2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import ModelSelector from './components/ModelSelector';
 import LanguageSelector from './components/LanguageSelector';
@@ -203,6 +203,95 @@ function App() {
   const [lang, setLang] = useState(() => {
     return localStorage.getItem('output_lang') || 'English';
   });
+
+  const [selectedClips, setSelectedClips] = useState(new Set());
+  const [showBatchSubtitle, setShowBatchSubtitle] = useState(false);
+  const [showBatchYoutube, setShowBatchYoutube] = useState(false);
+  const [batchSubtitleSettings, setBatchSubtitleSettings] = useState({
+    position: 'bottom', font_size: 24, font_name: 'Verdana',
+    font_color: '#FFFFFF', border_color: '#000000', border_width: 2,
+    bg_color: '#000000', bg_opacity: 0.0
+  });
+  const [batchYoutubeSettings, setBatchYoutubeSettings] = useState({
+    title: '', description: '', privacy_status: 'public'
+  });
+  const [batchProcessing, setBatchProcessing] = useState(false);
+  const [batchResults, setBatchResults] = useState(null);
+
+  const toggleClip = (index) => {
+    setSelectedClips(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const selectAllClips = () => {
+    if (!results?.clips) return;
+    setSelectedClips(new Set(results.clips.map((_, i) => i)));
+  };
+
+  const clearSelectedClips = () => {
+    setSelectedClips(new Set());
+  };
+
+  const handleBatchSubtitle = async () => {
+    if (!jobId || selectedClips.size === 0) return;
+    setBatchProcessing(true);
+    setBatchResults(null);
+    try {
+      const res = await fetch(getApiUrl('/api/batch/subtitle'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          job_id: jobId,
+          clip_indices: Array.from(selectedClips),
+          ...batchSubtitleSettings
+        })
+      });
+      const data = await res.json();
+      setBatchResults(data.results);
+      if (jobId) {
+        const refreshed = await pollJob(jobId);
+        if (refreshed.status === 'complete' && refreshed.result) {
+          setResults(refreshed.result);
+        }
+      }
+    } catch (e) {
+      setBatchResults([{ error: e.message }]);
+    } finally {
+      setBatchProcessing(false);
+    }
+  };
+
+  const handleBatchYoutubeUpload = async () => {
+    if (!jobId || selectedClips.size === 0) return;
+    setBatchProcessing(true);
+    setBatchResults(null);
+    try {
+      const res = await fetch(getApiUrl('/api/batch/youtube-upload'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Youtube-Refresh-Token': youtubeRefreshToken,
+          'X-Youtube-Client-Id': youtubeClientId,
+          'X-Youtube-Client-Secret': youtubeClientSecret,
+        },
+        body: JSON.stringify({
+          job_id: jobId,
+          clip_indices: Array.from(selectedClips),
+          ...batchYoutubeSettings
+        })
+      });
+      const data = await res.json();
+      setBatchResults(data.results);
+    } catch (e) {
+      setBatchResults([{ error: e.message }]);
+    } finally {
+      setBatchProcessing(false);
+    }
+  };
 
   const handleClipPlay = (startTime) => {
     setSyncedTime(startTime);
@@ -1214,27 +1303,67 @@ function App() {
                   )}
                 </h2>
 
-                <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-1 relative">
                   {results && results.clips && results.clips.length > 0 ? (
-                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
-                      {results.clips.map((clip, i) => (
-                        <ResultCard
-                          key={i}
-                          clip={clip}
-                          index={i}
-                          jobId={jobId}
-                          uploadPostKey={uploadPostKey}
-                          uploadUserId={uploadUserId}
-                          geminiApiKey={apiKey}
-                          elevenLabsKey={elevenLabsKey}
-                          youtubeClientId={youtubeClientId}
-                          youtubeClientSecret={youtubeClientSecret}
-                          youtubeRefreshToken={youtubeRefreshToken}
-                          onPlay={(time) => handleClipPlay(time)}
-                          onPause={handleClipPause}
-                        />
-                      ))}
-                    </div>
+                    <>
+                      {/* Batch toolbar */}
+                      {selectedClips.size > 0 && (
+                        <div className="sticky top-0 z-20 mb-3 bg-[#1a1a1e]/95 backdrop-blur-sm border border-primary/30 rounded-xl p-3 flex items-center gap-3 shadow-lg shadow-primary/10 animate-[fadeIn_0.15s_ease-out]">
+                          <button onClick={clearSelectedClips} className="text-zinc-400 hover:text-white transition-colors" title="Clear selection">
+                            <X size={16} />
+                          </button>
+                          <span className="text-xs text-zinc-300 font-medium min-w-[80px]">{selectedClips.size} selected</span>
+                          <button onClick={selectAllClips} className="text-xs text-primary hover:text-primary/80 transition-colors font-medium">Select all</button>
+                          <div className="ml-auto flex gap-2">
+                            <button
+                              onClick={() => { setShowBatchSubtitle(true); setBatchResults(null); }}
+                              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 rounded-lg text-xs font-bold transition-all"
+                            >
+                              <Type size={14} />
+                              Subtitles
+                            </button>
+                            <button
+                              onClick={() => { setShowBatchYoutube(true); setBatchResults(null); }}
+                              className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/20 border border-red-500/30 text-red-400 hover:bg-red-500/30 rounded-lg text-xs font-bold transition-all"
+                            >
+                              <Youtube size={14} />
+                              YouTube
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
+                        {results.clips.map((clip, i) => (
+                          <div key={i} className="relative group/card">
+                            {/* Selection checkbox */}
+                            <button
+                              onClick={() => toggleClip(i)}
+                              className={`absolute top-3 left-3 z-10 w-6 h-6 rounded-md border-2 flex items-center justify-center transition-all ${
+                                selectedClips.has(i)
+                                  ? 'bg-primary border-primary text-white scale-110 shadow-lg shadow-primary/30'
+                                  : 'bg-black/60 border-white/30 opacity-0 group-hover/card:opacity-100 hover:border-white'
+                              }`}
+                            >
+                              {selectedClips.has(i) && <Check size={14} strokeWidth={3} />}
+                            </button>
+                            <ResultCard
+                              clip={clip}
+                              index={i}
+                              jobId={jobId}
+                              uploadPostKey={uploadPostKey}
+                              uploadUserId={uploadUserId}
+                              geminiApiKey={apiKey}
+                              elevenLabsKey={elevenLabsKey}
+                              youtubeClientId={youtubeClientId}
+                              youtubeClientSecret={youtubeClientSecret}
+                              youtubeRefreshToken={youtubeRefreshToken}
+                              onPlay={(time) => handleClipPlay(time)}
+                              onPause={handleClipPause}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </>
                   ) : (
                     status === 'processing' ? (
                       <div className="h-full flex flex-col items-center justify-center text-zinc-500 space-y-4 opacity-50">
@@ -1345,6 +1474,156 @@ function App() {
                 Go to Settings
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Subtitle Modal */}
+      {showBatchSubtitle && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
+          <div className="bg-[#121214] border border-white/10 p-6 rounded-2xl w-full max-w-lg shadow-2xl relative max-h-[90vh] overflow-y-auto">
+            <button onClick={() => { setShowBatchSubtitle(false); setBatchResults(null); }} className="absolute top-4 right-4 text-zinc-500 hover:text-white z-10">
+              <X size={20} />
+            </button>
+            <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+              <Type className="text-primary" /> Batch Subtitles
+            </h3>
+            <p className="text-xs text-zinc-500 mb-4">Applying subtitles to <strong className="text-zinc-300">{selectedClips.size}</strong> selected clips</p>
+
+            <div className="space-y-4">
+              <div>
+                <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Position</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {['top', 'middle', 'bottom'].map(pos => (
+                    <button key={pos} onClick={() => setBatchSubtitleSettings(s => ({ ...s, position: pos }))}
+                      className={`p-2 rounded-lg border text-center text-xs font-medium transition-all ${batchSubtitleSettings.position === pos ? 'bg-primary/20 border-primary text-white' : 'bg-white/5 border-white/5 text-zinc-400 hover:bg-white/10'}`}>
+                      {pos.charAt(0).toUpperCase() + pos.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font Size: {batchSubtitleSettings.font_size}px</label>
+                <input type="range" min="12" max="48" value={batchSubtitleSettings.font_size}
+                  onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, font_size: parseInt(e.target.value) }))}
+                  className="w-full accent-primary" />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font Color</label>
+                  <input type="color" value={batchSubtitleSettings.font_color}
+                    onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, font_color: e.target.value }))}
+                    className="w-full h-8 rounded-lg bg-transparent border border-white/10 cursor-pointer" />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Border Color</label>
+                  <input type="color" value={batchSubtitleSettings.border_color}
+                    onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, border_color: e.target.value }))}
+                    className="w-full h-8 rounded-lg bg-transparent border border-white/10 cursor-pointer" />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Border Width</label>
+                <input type="range" min="0" max="5" value={batchSubtitleSettings.border_width}
+                  onChange={(e) => setBatchSubtitleSettings(s => ({ ...s, border_width: parseInt(e.target.value) }))}
+                  className="w-full accent-primary" />
+              </div>
+
+              <button onClick={handleBatchSubtitle} disabled={batchProcessing}
+                className="w-full py-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 text-black font-bold rounded-xl shadow-lg shadow-orange-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-50">
+                {batchProcessing ? <Loader2 size={20} className="animate-spin" /> : <Type size={20} />}
+                {batchProcessing ? 'Processing...' : `Apply Subtitles to ${selectedClips.size} Clips`}
+              </button>
+
+              {batchResults && (
+                <div className="mt-4 space-y-1.5 max-h-40 overflow-y-auto custom-scrollbar">
+                  {batchResults.map((r, i) => (
+                    <div key={i} className={`flex items-center gap-2 text-xs ${r.success ? 'text-green-400' : 'text-red-400'}`}>
+                      {r.success ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
+                      Clip #{r.clip_index + 1}: {r.success ? 'OK' : r.error}
+                      {r.success && r.new_video_url && <span className="text-zinc-500 ml-auto">subtitled</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch YouTube Upload Modal */}
+      {showBatchYoutube && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
+          <div className="bg-[#121214] border border-white/10 p-6 rounded-2xl w-full max-w-lg shadow-2xl relative max-h-[90vh] overflow-y-auto">
+            <button onClick={() => { setShowBatchYoutube(false); setBatchResults(null); }} className="absolute top-4 right-4 text-zinc-500 hover:text-white z-10">
+              <X size={20} />
+            </button>
+            <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+              <Youtube className="text-red-400" /> Batch YouTube Upload
+            </h3>
+            <p className="text-xs text-zinc-500 mb-4">Uploading <strong className="text-zinc-300">{selectedClips.size}</strong> clips to YouTube</p>
+
+            {!youtubeRefreshToken ? (
+              <div className="text-center py-6 space-y-3">
+                <AlertTriangle size={32} className="text-amber-400 mx-auto" />
+                <p className="text-sm text-zinc-400">YouTube not connected. Go to Settings → YouTube Direct Upload to set up.</p>
+                <button onClick={() => { setShowBatchYoutube(false); setActiveTab('settings'); }}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition-colors">
+                  Go to Settings
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Title template</label>
+                  <input type="text" value={batchYoutubeSettings.title}
+                    onChange={(e) => setBatchYoutubeSettings(s => ({ ...s, title: e.target.value }))}
+                    placeholder="My Viral Video # (auto-numbered)"
+                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50" />
+                  <p className="text-[10px] text-zinc-600 mt-1">A clip number will be appended automatically (e.g. "My Video #1")</p>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Description (shared)</label>
+                  <textarea value={batchYoutubeSettings.description}
+                    onChange={(e) => setBatchYoutubeSettings(s => ({ ...s, description: e.target.value }))}
+                    rows={3} placeholder="Common description for all clips..."
+                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50 resize-none" />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Privacy</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {['public', 'unlisted', 'private'].map(p => (
+                      <button key={p} onClick={() => setBatchYoutubeSettings(s => ({ ...s, privacy_status: p }))}
+                        className={`p-2 rounded-lg border text-center text-xs font-medium transition-all ${batchYoutubeSettings.privacy_status === p ? 'bg-red-500/20 border-red-500 text-white' : 'bg-white/5 border-white/5 text-zinc-400 hover:bg-white/10'}`}>
+                        {p.charAt(0).toUpperCase() + p.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button onClick={handleBatchYoutubeUpload} disabled={batchProcessing}
+                  className="w-full py-3 bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-red-400 text-white font-bold rounded-xl shadow-lg shadow-red-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-50">
+                  {batchProcessing ? <Loader2 size={20} className="animate-spin" /> : <Youtube size={20} />}
+                  {batchProcessing ? 'Uploading...' : `Upload ${selectedClips.size} Clips to YouTube`}
+                </button>
+
+                {batchResults && (
+                  <div className="mt-4 space-y-1.5 max-h-40 overflow-y-auto custom-scrollbar">
+                    {batchResults.map((r, i) => (
+                      <div key={i} className={`flex items-center gap-2 text-xs ${r.success ? 'text-green-400' : 'text-red-400'}`}>
+                        {r.success ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
+                        Clip #{r.clip_index + 1}: {r.success ? (
+                          <a href={r.video_url} target="_blank" rel="noopener noreferrer" className="underline hover:text-green-300">{r.video_id}</a>
+                        ) : r.error}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
