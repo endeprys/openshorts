@@ -36,7 +36,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+JOB_RETENTION_SECONDS = 86400  # 24 hours retention for in-memory jobs (DB-backed projects persist forever)
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 
 # Application State
@@ -98,10 +98,17 @@ async def cleanup_jobs():
             now = time.time()
             
             # Simple directory cleanup based on modification time
-            # Check OUTPUT_DIR
+            # Check OUTPUT_DIR — skip directories that still have a DB project
             for job_id in os.listdir(OUTPUT_DIR):
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
+                    # Keep files if project still exists in DB (user may still need them)
+                    try:
+                        from db import get_project
+                        if get_project(job_id):
+                            continue
+                    except Exception:
+                        pass
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
                         print(f"🧹 Purging old job: {job_id}")
                         shutil.rmtree(job_path, ignore_errors=True)
@@ -172,9 +179,9 @@ async def schedule_dispatcher():
     print("📅 Schedule dispatcher started.")
     while True:
         try:
-            # Mark overdue schedules
+            # Mark overdue schedules (past grace period) first
             mark_overdue_schedules()
-            # Pick up to 2 due schedules
+            # Pick up to 2 due schedules (within grace window)
             due = get_due_schedules(limit=2)
             for s in due:
                 print(f"📤 Dispatching schedule {s['id']}...")
@@ -2069,6 +2076,70 @@ async def api_update_schedule(schedule_id: str,
     if not s:
         raise HTTPException(status_code=404, detail="Schedule not found")
     return s
+
+@app.post("/api/schedules/{schedule_id}/publish")
+async def api_publish_schedule(
+    schedule_id: str,
+    x_youtube_refresh_token: Optional[str] = Header(None, alias="X-Youtube-Refresh-Token"),
+    x_youtube_client_id: Optional[str] = Header(None, alias="X-Youtube-Client-Id"),
+    x_youtube_client_secret: Optional[str] = Header(None, alias="X-Youtube-Client-Secret"),
+):
+    """Manually publish an overdue (or any non-done) schedule immediately."""
+    from youtube_uploader import refresh_access_token, upload_video
+    s = get_schedule(schedule_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if s['status'] == 'done':
+        raise HTTPException(status_code=400, detail="Schedule already published")
+
+    # Use provided headers first, fall back to DB stored tokens
+    refresh_token = x_youtube_refresh_token or s['youtube_refresh_token']
+    client_id = x_youtube_client_id or s['youtube_client_id']
+    client_secret = x_youtube_client_secret or s['youtube_client_secret']
+
+    if not refresh_token or not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="YouTube OAuth credentials missing. Re-authorize and try again.")
+
+    update_schedule(schedule_id, status='uploading')
+    try:
+        token_data = refresh_access_token(
+            client_id, client_secret, refresh_token
+        )
+        access_token = token_data["access_token"]
+
+        conn = db_module.get_conn()
+        clip_row = conn.execute(
+            "SELECT * FROM clips WHERE id=?", (s['clip_id'],)
+        ).fetchone()
+        conn.close()
+        if not clip_row:
+            update_schedule(schedule_id, status='failed', error='Clip not found')
+            raise HTTPException(status_code=404, detail="Clip not found")
+        clip_dict = dict(clip_row)
+        file_path = os.path.join(OUTPUT_DIR, s['project_id'], clip_dict['video_url'].split('/')[-1])
+        if not os.path.exists(file_path):
+            update_schedule(schedule_id, status='failed', error=f'Video file not found: {file_path}')
+            raise HTTPException(status_code=404, detail=f"Video file not found")
+
+        upload_title = s['title'] or clip_dict.get('title', 'Viral Short')
+        upload_desc = (s['description'] or
+                       clip_dict.get('hook_text', '') or
+                       clip_dict.get('description_tiktok', '') or
+                       clip_dict.get('description_instagram', '') or '')
+        result = upload_video(
+            file_path=file_path,
+            access_token=access_token,
+            title=upload_title,
+            description=upload_desc,
+            privacy_status=s['privacy_status'],
+        )
+        video_id = result.get("id", "")
+        update_schedule(schedule_id, status='done',
+                        video_url=f"https://youtu.be/{video_id}")
+        return {"success": True, "video_id": video_id, "url": f"https://youtu.be/{video_id}"}
+    except Exception as e:
+        update_schedule(schedule_id, status='failed', error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/schedules/{schedule_id}")
 async def api_delete_schedule(schedule_id: str):

@@ -32,13 +32,14 @@ ASPECT_RATIO = 9 / 16
 CHUNK_PROMPT_TEMPLATE = """
 You are analyzing TIME SEGMENT {chunk_start}s–{chunk_end}s of a {video_duration}s video.
 Pick {per_chunk_clips} viral moment(s) from WITHIN THIS SEGMENT ONLY.
-Each clip 15–60s, must start >= {chunk_start} and end <= {chunk_end}.
+Each clip {min_clip_duration}–{max_clip_duration}s, must start >= {chunk_start} and end <= {chunk_end}.
 
 ⚠️ RULES:
+- Each clip must be a COMPLETE THOUGHT, TOPIC, or SCENE.
+- Cut at natural topic shifts, pauses, or scene changes — never mid-sentence.
+- Longer clips are preferred when the content forms a cohesive segment.
 - Return ABSOLUTE SECONDS, 0–3 decimals (e.g. 12.340).
 - 0 ≤ start < end ≤ {video_duration}.
-- Prefer starting 0.2–0.4s BEFORE the hook, ending 0.2–0.4s AFTER.
-- Cut at silence; never mid-word.
 
 WORDS IN THIS SEGMENT:
 {words_json}
@@ -900,7 +901,7 @@ def _call_ollama(prompt, model_name, video_duration):
         return None, None
 
 
-def get_viral_clips(transcript_result, video_duration, model_name=None, max_clips=30):
+def get_viral_clips(transcript_result, video_duration, model_name=None, max_clips=30, min_clip_duration=15, max_clip_duration=60):
     """
     Chunked AI analysis: split transcript by time, analyze each chunk separately,
     then merge results. This ensures full-video coverage and avoids 'lost in the middle'.
@@ -920,14 +921,19 @@ def get_viral_clips(transcript_result, video_duration, model_name=None, max_clip
 
     output_language = os.getenv("OUTPUT_LANGUAGE", "English")
 
-    # Determine number of chunks: 1 chunk per ~3 clips, min 1, max ~15
-    num_chunks = max(1, min(int(max_clips / 2), 15))
+    # Smarter chunking: short videos → single chunk (gemini sees full context)
+    # Long videos → split into fewer, larger chunks so clips can be longer
+    if video_duration < 300:  # < 5 min
+        num_chunks = 1
+    else:
+        num_chunks = min(max_clips, max(2, int(video_duration / (max_clip_duration * 2.5))))
+        num_chunks = max(2, min(num_chunks, 10))
     chunk_duration = video_duration / num_chunks
     per_chunk_clips = max(1, (max_clips + num_chunks - 1) // num_chunks)  # ceil division
     total_target = per_chunk_clips * num_chunks  # may be slightly over max_clips
 
     print(f"🧠 Smart chunk analysis: {num_chunks} chunks × {per_chunk_clips} clips each "
-          f"(~{chunk_duration:.0f}s per chunk), targeting ~{total_target} clips total")
+          f"(~{chunk_duration:.0f}s per chunk, targeting ~{total_target} clips total)")
 
     is_ollama = model_name.startswith("ollama:")
     caller = _call_ollama if is_ollama else _call_gemini
@@ -956,6 +962,8 @@ def get_viral_clips(transcript_result, video_duration, model_name=None, max_clip
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             per_chunk_clips=per_chunk_clips,
+            min_clip_duration=min_clip_duration,
+            max_clip_duration=max_clip_duration,
             transcript_text=chunk_text[:10000],  # cap per-chunk transcript
             words_json=json.dumps(chunk_words[:2000]),  # cap per-chunk words
             output_language=output_language
@@ -992,11 +1000,13 @@ def get_viral_clips(transcript_result, video_duration, model_name=None, max_clip
         print("❌ No clips found in any chunk.")
         return None
 
-    # Deduplicate: remove clips whose start times are within 5s of each other
+    # Deduplicate: remove clips whose start times are too close
+    # Use a wider gap for longer clips so we don't merge semantic segments
+    gap_threshold = max(10, min_clip_duration * 0.3)
     all_shorts.sort(key=lambda x: x['start'])
     deduped = []
     for s in all_shorts:
-        if not deduped or s['start'] - deduped[-1]['start'] > 5:
+        if not deduped or s['start'] - deduped[-1]['start'] > gap_threshold:
             deduped.append(s)
 
     print(f"🔥 Total: {len(deduped)} unique clips from {num_chunks} chunks "
@@ -1100,12 +1110,26 @@ if __name__ == '__main__':
         output_language = args.lang or os.getenv("OUTPUT_LANGUAGE", "English")
         os.environ["OUTPUT_LANGUAGE"] = output_language
         max_clips = args.max_clips or int(os.getenv("MAX_CLIPS", "30"))
-        # Cap max_clips so each clip has at least 15s of video to work with
-        max_possible = int(duration // 15)
+        # Scale clip duration and count by video length:
+        # short video → 1–2 long clips; long video → 50s–5min semantic segments
+        if duration < 120:
+            min_clip_duration = 30
+            max_clip_duration = 90
+            max_clips = min(max_clips, 2)
+        elif duration < 600:
+            min_clip_duration = 50
+            max_clip_duration = 120
+            max_clips = min(max_clips, int(duration // min_clip_duration))
+        else:
+            min_clip_duration = 50
+            max_clip_duration = min(300, int(duration * 0.4))  # up to 5 min, but ≤40% of video
+            max_clips = min(max_clips, int(duration // min_clip_duration))
+        max_possible = int(duration // min_clip_duration)
         if max_clips > max_possible:
-            print(f"⚠️ Video is only {duration:.0f}s long — capping max_clips from {max_clips} to {max_possible}")
+            print(f"⚠️ Video is only {duration:.0f}s long — capping max_clips from {max_clips} to {max_possible} "
+                  f"(min {min_clip_duration}s/clip, max {max_clip_duration}s/clip)")
             max_clips = max_possible
-        clips_data = get_viral_clips(transcript, duration, model_name=model_name, max_clips=max_clips)
+        clips_data = get_viral_clips(transcript, duration, model_name=model_name, max_clips=max_clips, min_clip_duration=min_clip_duration, max_clip_duration=max_clip_duration)
         
         if not clips_data or 'shorts' not in clips_data:
             if args.no_fallback:

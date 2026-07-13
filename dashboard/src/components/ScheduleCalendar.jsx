@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ChevronLeft, ChevronRight, Clock, Youtube, CheckCircle2, AlertTriangle, Loader2, Trash2, ExternalLink, Calendar as CalendarIcon } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Clock, Youtube, CheckCircle2, AlertTriangle, Loader2, Trash2, ExternalLink, Calendar as CalendarIcon, Send } from 'lucide-react';
 import { getApiUrl } from '../config';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -13,7 +13,7 @@ const STATUS_COLORS = {
     overdue: { bg: 'bg-zinc-500/20', text: 'text-zinc-400', dot: 'bg-zinc-400' },
 };
 
-export default function ScheduleCalendar() {
+export default function ScheduleCalendar({ youtubeRefreshToken, youtubeClientId, youtubeClientSecret }) {
     const [entries, setEntries] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -22,6 +22,8 @@ export default function ScheduleCalendar() {
     const [month, setMonth] = useState(now.getMonth());
     const [selectedEntry, setSelectedEntry] = useState(null);
     const [editingTime, setEditingTime] = useState('');
+    const [publishingId, setPublishingId] = useState(null);
+    const [expandedDay, setExpandedDay] = useState(null);
 
     const dateFrom = new Date(year, month, 1).toISOString();
     const dateTo = new Date(year, month + 1, 0, 23, 59, 59).toISOString();
@@ -90,6 +92,24 @@ export default function ScheduleCalendar() {
         }
     };
 
+    const handlePublishNow = async (id) => {
+        setPublishingId(id);
+        try {
+            const headers = {};
+            if (youtubeRefreshToken) headers['X-Youtube-Refresh-Token'] = youtubeRefreshToken;
+            if (youtubeClientId) headers['X-Youtube-Client-Id'] = youtubeClientId;
+            if (youtubeClientSecret) headers['X-Youtube-Client-Secret'] = youtubeClientSecret;
+            const res = await fetch(getApiUrl(`/api/schedules/${id}/publish`), { method: 'POST', headers });
+            if (!res.ok) throw new Error(await res.text());
+            await loadCalendar();
+            setSelectedEntry(null);
+        } catch (e) {
+            alert('Publish failed: ' + e.message);
+        } finally {
+            setPublishingId(null);
+        }
+    };
+
     const pad = n => String(n).padStart(2, '0');
     const formatTime = (iso) => {
         const d = new Date(iso);
@@ -137,16 +157,19 @@ export default function ScheduleCalendar() {
                     const day = i + 1;
                     const dayEntries = entriesByDay[day] || [];
                     const isToday = year === today.getFullYear() && month === today.getMonth() && day === today.getDate();
+                    const isExpanded = expandedDay === day;
+                    const visibleEntries = isExpanded ? dayEntries : dayEntries.slice(0, 3);
+                    const hasMore = dayEntries.length > 3;
                     return (
                         <div
                             key={day}
-                            className={`aspect-square rounded-xl border p-1.5 flex flex-col transition-all ${
-                                isToday ? 'border-primary/40 bg-primary/5' : 'border-white/5 bg-white/[0.02] hover:border-white/20'
-                            }`}
+                            className={`rounded-xl border p-1.5 flex flex-col transition-all ${
+                                isExpanded ? 'border-primary/40 bg-primary/5 row-span-3' : 'aspect-square'
+                            } ${isToday && !isExpanded ? 'border-primary/40 bg-primary/5' : 'border-white/5 bg-white/[0.02] hover:border-white/20'}`}
                         >
                             <span className={`text-[11px] font-medium ${isToday ? 'text-primary' : 'text-zinc-400'}`}>{day}</span>
-                            <div className="flex-1 space-y-0.5 mt-1 overflow-hidden">
-                                {dayEntries.slice(0, 3).map(entry => {
+                            <div className={`flex-1 space-y-0.5 mt-1 ${isExpanded ? '' : 'overflow-hidden'}`}>
+                                {visibleEntries.map(entry => {
                                     const sc = STATUS_COLORS[entry.status] || STATUS_COLORS.pending;
                                     return (
                                         <button
@@ -158,8 +181,17 @@ export default function ScheduleCalendar() {
                                         </button>
                                     );
                                 })}
-                                {dayEntries.length > 3 && (
-                                    <span className="text-[9px] text-zinc-600 pl-1">+{dayEntries.length - 3} more</span>
+                                {hasMore && !isExpanded && (
+                                    <button onClick={() => setExpandedDay(day)}
+                                        className="text-[9px] text-primary/70 hover:text-primary pl-1 transition-colors">
+                                        +{dayEntries.length - 3} more
+                                    </button>
+                                )}
+                                {hasMore && isExpanded && (
+                                    <button onClick={() => setExpandedDay(null)}
+                                        className="text-[9px] text-zinc-500 hover:text-white pl-1 transition-colors">
+                                        Show less
+                                    </button>
                                 )}
                             </div>
                         </div>
@@ -219,6 +251,22 @@ export default function ScheduleCalendar() {
                                 </p>
                             )}
                         </div>
+
+                        {/* Publish Now */}
+                        {selectedEntry.status === 'overdue' || selectedEntry.status === 'failed' ? (
+                            <div className="mt-4 pt-4 border-t border-white/5">
+                                <button onClick={() => handlePublishNow(selectedEntry.id)}
+                                    disabled={publishingId === selectedEntry.id}
+                                    className="w-full flex items-center justify-center gap-2 py-2.5 bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg text-xs font-bold hover:bg-green-500/30 transition-all disabled:opacity-50">
+                                    {publishingId === selectedEntry.id ? (
+                                        <Loader2 size={14} className="animate-spin" />
+                                    ) : (
+                                        <Send size={14} />
+                                    )}
+                                    {publishingId === selectedEntry.id ? 'Publishing...' : 'Publish Now'}
+                                </button>
+                            </div>
+                        ) : null}
 
                         {/* Reschedule */}
                         {selectedEntry.status === 'pending' || selectedEntry.status === 'overdue' ? (

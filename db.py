@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "openshorts.db")
+SCHEDULE_GRACE_MINUTES = 2  # grace period before marking a schedule as overdue
 
 def get_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -297,11 +298,13 @@ def get_due_schedules(limit: int = 2) -> List[dict]:
     return [dict(r) for r in rows]
 
 def mark_overdue_schedules():
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=SCHEDULE_GRACE_MINUTES)).isoformat()
     conn = get_conn()
     conn.execute("""
         UPDATE schedules SET status='overdue', updated_at=?
         WHERE status='pending' AND scheduled_for <= ?
-    """, (now_iso(), now_iso()))
+    """, (now_iso(), cutoff))
     conn.commit()
     conn.close()
 

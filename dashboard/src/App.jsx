@@ -19,42 +19,7 @@ import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
-const SECRET_KEY = import.meta.env.VITE_ENCRYPTION_KEY || "OpenShorts-Static-Salt-Change-Me";
-const ENCRYPTION_PREFIX = "ENC:";
-
-const encrypt = (text) => {
-  if (!text) return '';
-  try {
-    const xor = text.split('').map((c, i) =>
-      String.fromCharCode(c.charCodeAt(0) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length))
-    ).join('');
-    return ENCRYPTION_PREFIX + btoa(xor);
-  } catch (e) {
-    console.error("Encryption failed", e);
-    return text;
-  }
-};
-
-const decrypt = (text) => {
-  if (!text) return '';
-  if (text.startsWith(ENCRYPTION_PREFIX)) {
-    try {
-      const raw = text.slice(ENCRYPTION_PREFIX.length);
-      // Check if it's plain base64 or our custom XOR (simple try)
-      const xor = atob(raw);
-      const result = xor.split('').map((c, i) =>
-        String.fromCharCode(c.charCodeAt(0) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length))
-      ).join('');
-      return result;
-    } catch (e) {
-      // Fallback if decryption fails (might be old plain text)
-      return '';
-    }
-  }
-  // Backward compatibility: If no prefix, assume old plain text (or return empty if you want to force re-login)
-  // For migration: Return text as is, so it populates the field, and next save will encrypt it.
-  return text;
-};
+import { encrypt, decrypt } from './lib/crypto';
 
 // Simple TikTok icon sine Lucide might not have it or it varies
 const TikTokIcon = ({ size = 16, className = "" }) => (
@@ -858,7 +823,7 @@ function App() {
           {/* View: Schedule */}
           {activeTab === 'schedule' && (
             <div className="h-full overflow-y-auto animate-[fadeIn_0.3s_ease-out]">
-              <ScheduleCalendar />
+              <ScheduleCalendar youtubeRefreshToken={youtubeRefreshToken} youtubeClientId={youtubeClientId} youtubeClientSecret={youtubeClientSecret} />
             </div>
           )}
 

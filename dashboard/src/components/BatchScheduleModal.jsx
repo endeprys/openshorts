@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Calendar, Clock, Youtube, Loader2, CheckCircle2, AlertTriangle, Globe } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { decrypt } from '../lib/crypto';
 
 const TIMEZONES = [
     { value: 'UTC', label: 'UTC (GMT+00:00)' },
@@ -89,9 +90,9 @@ export default function BatchScheduleModal({ clips, selectedIndices, projectId, 
                 interval_hours: intervalHours,
                 timezone,
                 privacy_status: privacy,
-                youtube_refresh_token: localStorage.getItem('youtubeRefreshToken_v1') || '',
-                youtube_client_id: localStorage.getItem('youtubeClientId_v1') || '',
-                youtube_client_secret: localStorage.getItem('youtubeClientSecret_v1') || '',
+                youtube_refresh_token: decrypt(localStorage.getItem('youtubeRefreshToken_v1') || ''),
+                youtube_client_id: decrypt(localStorage.getItem('youtubeClientId_v1') || ''),
+                youtube_client_secret: decrypt(localStorage.getItem('youtubeClientSecret_v1') || ''),
             };
 
             if (mode === 'exact') {
