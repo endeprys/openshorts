@@ -75,6 +75,14 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_schedules_project ON schedules(project_id);
         CREATE INDEX IF NOT EXISTS idx_schedules_status ON schedules(status);
         CREATE INDEX IF NOT EXISTS idx_schedules_for ON schedules(scheduled_for);
+
+        CREATE TABLE IF NOT EXISTS youtube_creds (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            refresh_token   TEXT NOT NULL DEFAULT '',
+            client_id       TEXT NOT NULL DEFAULT '',
+            client_secret   TEXT NOT NULL DEFAULT '',
+            updated_at      TEXT NOT NULL
+        );
     """)
     conn.commit()
     conn.close()
@@ -307,6 +315,27 @@ def mark_overdue_schedules():
     """, (now_iso(), cutoff))
     conn.commit()
     conn.close()
+
+def save_youtube_creds(refresh_token: str, client_id: str, client_secret: str):
+    conn = get_conn()
+    ts = now_iso()
+    conn.execute("""
+        INSERT INTO youtube_creds (id, refresh_token, client_id, client_secret, updated_at)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            refresh_token=excluded.refresh_token,
+            client_id=excluded.client_id,
+            client_secret=excluded.client_secret,
+            updated_at=excluded.updated_at
+    """, (refresh_token, client_id, client_secret, ts))
+    conn.commit()
+    conn.close()
+
+def get_youtube_creds() -> Optional[dict]:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM youtube_creds WHERE id=1").fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 def get_calendar(date_from: str, date_to: str) -> List[dict]:
     conn = get_conn()

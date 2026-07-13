@@ -1002,6 +1002,18 @@ function App() {
                               localStorage.setItem('youtubeRefreshToken_v1', encrypt(tokenData.refresh_token));
                               setYoutubeRefreshToken(tokenData.refresh_token);
                               setYoutubeAuthed(true);
+                              // Save credentials server-side for background scheduler
+                              try {
+                                await fetch(getApiUrl('/api/youtube/credentials'), {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({
+                                    refresh_token: tokenData.refresh_token,
+                                    client_id: youtubeClientId,
+                                    client_secret: youtubeClientSecret,
+                                  }),
+                                });
+                              } catch (_) { /* non-blocking */ }
                               alert('YouTube connected!');
                               popup?.close();
                             } else {

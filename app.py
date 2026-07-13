@@ -21,7 +21,8 @@ from db import (init_db, create_project, get_project, list_projects, update_proj
                 create_clip, list_clips, delete_clips_by_project, get_clip, update_clip,
                 update_clip_video_url, get_clip_by_project_and_index,
                 create_schedule, get_schedule, list_schedules, update_schedule, delete_schedule,
-                get_due_schedules, mark_overdue_schedules, get_calendar)
+                get_due_schedules, mark_overdue_schedules, get_calendar,
+                save_youtube_creds, get_youtube_creds)
 from datetime import datetime, timezone
 
 load_dotenv()
@@ -177,6 +178,39 @@ async def schedule_dispatcher():
     """Background worker that dispatches due YouTube uploads."""
     await asyncio.sleep(10)
     print("📅 Schedule dispatcher started.")
+    def _upload_schedule(s, access_token):
+        c = db_module.get_conn()
+        clip_row = c.execute(
+            "SELECT * FROM clips WHERE id=?", (s['clip_id'],)
+        ).fetchone()
+        c.close()
+        if not clip_row:
+            update_schedule(s['id'], status='failed', error='Clip not found')
+            return False
+        clip_dict = dict(clip_row)
+        file_path = os.path.join(OUTPUT_DIR, s['project_id'], clip_dict['video_url'].split('/')[-1])
+        if not os.path.exists(file_path):
+            update_schedule(s['id'], status='failed', error=f'Video file not found: {file_path}')
+            return False
+
+        upload_title = s['title'] or clip_dict.get('title', 'Viral Short')
+        upload_desc = (s['description'] or
+                       clip_dict.get('hook_text', '') or
+                       clip_dict.get('description_tiktok', '') or
+                       clip_dict.get('description_instagram', '') or '')
+        result = upload_video(
+            file_path=file_path,
+            access_token=access_token,
+            title=upload_title,
+            description=upload_desc,
+            privacy_status=s['privacy_status'],
+        )
+        video_id = result.get("id", "")
+        update_schedule(s['id'], status='done',
+                        video_url=f"https://youtu.be/{video_id}")
+        print(f"   ✅ Uploaded: {video_id}")
+        return True
+
     while True:
         try:
             # Mark overdue schedules (past grace period) first
@@ -194,44 +228,32 @@ async def schedule_dispatcher():
                         s['youtube_refresh_token']
                     )
                     access_token = token_data["access_token"]
-
-                    c = db_module.get_conn()
-                    clip_row = c.execute(
-                        "SELECT * FROM clips WHERE id=?", (s['clip_id'],)
-                    ).fetchone()
-                    c.close()
-                    if not clip_row:
-                        update_schedule(s['id'], status='failed', error='Clip not found')
-                        continue
-                    clip_dict = dict(clip_row)
-                    file_path = os.path.join(OUTPUT_DIR, s['project_id'], clip_dict['video_url'].split('/')[-1])
-                    if not os.path.exists(file_path):
-                        update_schedule(s['id'], status='failed', error=f'Video file not found: {file_path}')
-                        continue
-
-                    upload_title = s['title'] or clip_dict.get('title', 'Viral Short')
-                    upload_desc = (s['description'] or
-                                   clip_dict.get('hook_text', '') or
-                                   clip_dict.get('description_tiktok', '') or
-                                   clip_dict.get('description_instagram', '') or '')
-                    result = upload_video(
-                        file_path=file_path,
-                        access_token=access_token,
-                        title=upload_title,
-                        description=upload_desc,
-                        privacy_status=s['privacy_status'],
-                    )
-                    video_id = result.get("id", "")
-                    update_schedule(s['id'], status='done',
-                                    video_url=f"https://youtu.be/{video_id}")
-                    print(f"   ✅ Uploaded: {video_id}")
+                    _upload_schedule(s, access_token)
                 except Exception as e:
                     estr = str(e).lower()
-                    # Auth errors: token expired/revoked (Google returns invalid_grant)
                     if 'invalid_grant' in estr or 'unauthorized' in estr:
                         print(f"   ⏰ Schedule auth failed (token expired): {e}")
-                        update_schedule(s['id'], status='overdue',
-                                        error='YouTube token expired. Open the calendar and click "Publish Now".')
+                        global_creds = get_youtube_creds()
+                        if global_creds and global_creds.get('refresh_token'):
+                            try:
+                                token_data = refresh_access_token(
+                                    global_creds['client_id'],
+                                    global_creds['client_secret'],
+                                    global_creds['refresh_token'],
+                                )
+                                access_token = token_data["access_token"]
+                                update_schedule(s['id'],
+                                    youtube_refresh_token=global_creds['refresh_token'],
+                                    youtube_client_id=global_creds['client_id'],
+                                    youtube_client_secret=global_creds['client_secret'])
+                                _upload_schedule(s, access_token)
+                            except Exception as e2:
+                                print(f"   ⏰ Global token also failed: {e2}")
+                                update_schedule(s['id'], status='overdue',
+                                    error='YouTube token expired. Re-authorize in Settings, then click "Publish Now".')
+                        else:
+                            update_schedule(s['id'], status='overdue',
+                                error='YouTube token expired. Re-authorize in Settings, then click "Publish Now".')
                     else:
                         print(f"   ❌ Schedule upload failed: {e}")
                         update_schedule(s['id'], status='failed', error=str(e))
@@ -1896,6 +1918,21 @@ async def youtube_upload(
 
     except Exception as e:
         print(f"❌ YouTube Upload Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class YoutubeCredentialsRequest(BaseModel):
+    refresh_token: str
+    client_id: str
+    client_secret: str
+
+@app.post("/api/youtube/credentials")
+async def api_save_youtube_credentials(req: YoutubeCredentialsRequest):
+    """Store latest YouTube credentials server-side for background dispatcher."""
+    try:
+        save_youtube_creds(req.refresh_token, req.client_id, req.client_secret)
+        print(f"💾 YouTube credentials saved server-side")
+        return {"success": True}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
