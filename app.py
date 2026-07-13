@@ -226,8 +226,15 @@ async def schedule_dispatcher():
                                     video_url=f"https://youtu.be/{video_id}")
                     print(f"   ✅ Uploaded: {video_id}")
                 except Exception as e:
-                    print(f"   ❌ Schedule upload failed: {e}")
-                    update_schedule(s['id'], status='failed', error=str(e))
+                    estr = str(e).lower()
+                    # Auth errors: token expired/revoked (Google returns invalid_grant)
+                    if 'invalid_grant' in estr or 'unauthorized' in estr:
+                        print(f"   ⏰ Schedule auth failed (token expired): {e}")
+                        update_schedule(s['id'], status='overdue',
+                                        error='YouTube token expired. Open the calendar and click "Publish Now".')
+                    else:
+                        print(f"   ❌ Schedule upload failed: {e}")
+                        update_schedule(s['id'], status='failed', error=str(e))
         except Exception as e:
             print(f"⚠️ Schedule dispatcher error: {e}")
         await asyncio.sleep(30)
@@ -2134,8 +2141,13 @@ async def api_publish_schedule(
             privacy_status=s['privacy_status'],
         )
         video_id = result.get("id", "")
-        update_schedule(schedule_id, status='done',
-                        video_url=f"https://youtu.be/{video_id}")
+        update_kwargs = {'status': 'done', 'video_url': f"https://youtu.be/{video_id}"}
+        # Update stored tokens with fresh ones from browser headers
+        if x_youtube_refresh_token:
+            update_kwargs['youtube_refresh_token'] = x_youtube_refresh_token
+            update_kwargs['youtube_client_id'] = x_youtube_client_id or s['youtube_client_id']
+            update_kwargs['youtube_client_secret'] = x_youtube_client_secret or s['youtube_client_secret']
+        update_schedule(schedule_id, **update_kwargs)
         return {"success": True, "video_id": video_id, "url": f"https://youtu.be/{video_id}"}
     except Exception as e:
         update_schedule(schedule_id, status='failed', error=str(e))
