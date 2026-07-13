@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["CLAUDE.md"],
+  "references": {
+    "docs": {
+      "path": ".",
+      "description": "Use for project structure, architecture, and configuration conventions"
+    }
+  }
+}
